@@ -1,0 +1,5 @@
+logs/
+last_response.json
+__pycache__/
+*.pyc
+accounts.json.bak
