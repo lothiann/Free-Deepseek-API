@@ -32,7 +32,7 @@ FALLBACK_MODEL = "deepseek-chat"
 # sends model_type="default" for every option, so the field carries no
 # information. Reasoning is a separate switch ("DeepThink"), not a model.
 # See MODELS below for the OpenAI-facing ids and map_thinking() for the
-# effort mapping. MODELS below lists the OpenAI-facing ids.
+# thinking/search switches. MODELS below lists the OpenAI-facing ids.
 DEFAULT_MODEL_TYPE = "default"
 
 # ===== STARTUP MENU STATE (toggled from the console before launch) =====
@@ -526,9 +526,23 @@ def _auth_lock():
 
 STOP_GENERATION_JS = """
     () => {
+        // The Stop control is NOT a <button>: it is a div[role="button"] whose
+        // only child is a filled rounded-square svg glyph. It carries no
+        // aria-label and no text, so scanning <button> labels can never find
+        // it - match the glyph's path data instead. The label scan stays as a
+        // fallback in case the icon ever changes.
+        const SQUARE_GLYPH = /M2\\s*4\\.88C2\\s*3\\.68009/;
+        const visible = (el) => !!(el.offsetWidth || el.offsetHeight);
+        for (const el of document.querySelectorAll('div[role="button"]')) {
+            const path = el.querySelector('svg path');
+            if (path && SQUARE_GLYPH.test(path.getAttribute('d') || '') && visible(el)) {
+                el.click();
+                return true;
+            }
+        }
         for (const b of document.querySelectorAll('button')) {
             const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim();
-            if (/stop|\\u505c\\u6b62|halt/i.test(label) && (b.offsetWidth || b.offsetHeight)) {
+            if (/stop|\\u505c\\u6b62|halt/i.test(label) && visible(b)) {
                 b.click();
                 return true;
             }
@@ -558,55 +572,95 @@ The ONLY tool-call format is DSML. Ignore every other format you may know - mark
 One call, one string parameter:
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="$TOOL_NAME">
-<｜DSML｜ parameter name="$PARAMETER_NAME" string="true">$PARAMETER_VALUE
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true">$PARAMETER_VALUE</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
 
 One call, several parameters:
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="$TOOL_NAME">
-<｜DSML｜ parameter name="param_name" string="true">value
-<｜DSML｜ parameter name="count" string="false">5
+<｜DSML｜ parameter name="param_name" string="true">value</｜DSML｜ parameter>
+<｜DSML｜ parameter name="count" string="false">5</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
 
 Several calls in one turn = one <｜DSML｜ invoke> per tool, all inside ONE <｜DSML｜ calls> block:
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="TOOL_NAME_1">
-<｜DSML｜ parameter name="p" string="true">v
+<｜DSML｜ parameter name="p" string="true">v</｜DSML｜ parameter>
+</｜DSML｜ invoke>
 <｜DSML｜ invoke name="TOOL_NAME_2">
-<｜DSML｜ parameter name="p" string="true">v
+<｜DSML｜ parameter name="p" string="true">v</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+A tool with no parameters:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="clear">
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
 
 <rules>
 # Rules:
+- You may write ONLY: (1) normal prose/answer text, and (2) <｜DSML｜ calls> blocks. Nothing else in any structured format.
 - A string parameter is written RAW, exactly as-is, with string="true".
 - Every other type (number, boolean, array, object, null) is written as JSON with string="false": <｜DSML｜ parameter name="n" string="false">42, <｜DSML｜ parameter name="b" string="false">true, <｜DSML｜ parameter name="a" string="false">[1, 2], <｜DSML｜ parameter name="o" string="false">{"a": 1}.
 - A tool with no parameters is just <｜DSML｜ invoke name="clear">.
-- These tags have NO closing tag. A parameter value runs until the next <｜DSML｜ parameter>, the next <｜DSML｜ invoke>, or the end of the block.
 - Parameter names MUST match that tool's schema exactly, and the tool name MUST be one of the <allowed_tools>.
+- If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
+- If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
+- Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\) - raw backslashes no longer break anything, but keep writing them doubled.
+- Raw inner quotes in string values are fine, they are plain text between the opening and the closing parameter tag: <｜DSML｜ parameter name="command" string="true">rg -n "pattern" src/</｜DSML｜ parameter>.
+- Don't break anything, even if you've already broken it in the chat history.
+- Don't write "The user reported ..." and similar phrases.
 - NEVER write anything after the <｜DSML｜ calls> block.
+- NEVER write \\n outside the tool call - this does NOT work.
 - Tool results arrive as <tool_result>...</tool_result> history lines.
+- It is recommended to use a colon to indicate that you are calling the tool:
+
+Now I will read:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="read">
+<｜DSML｜ parameter name="filePath" string="true">/project/file.txt</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
 </rules>
 
 <bad_examples>
-{"name": "bash", "arguments": {"command": "dir"}}<- bare JSON is not a tool call
-<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="false">"dir"   <- a string value must not be JSON-quoted
+<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ calls>   <- missing </｜DSML｜ parameter> and </｜DSML｜ invoke>
+<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ parameter></｜DSML｜ calls>   <- missing </｜DSML｜ invoke>
+<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ parameter></｜DSML｜ invoke>   <- missing </｜DSML｜ calls>
+<｜DSML｜ calls><｜DSML｜ invoke><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>   <- missing name= on invoke
+<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="false">"dir"</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>   <- a string value must not be JSON-quoted
 I'll read it now...                                                                  <- narrated instead of calling
+<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">rg -n "p</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>   <- unterminated value, inner quote never closed
 </bad_examples>
 
 <good_examples>
 single call:
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="read">
-<｜DSML｜ parameter name="filePath" string="true">/project/file.txt
+<｜DSML｜ parameter name="filePath" string="true">/project/file.txt</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
 
 parallel calls:
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="glob">
-<｜DSML｜ parameter name="pattern" string="true">**/*.ts
+<｜DSML｜ parameter name="pattern" string="true">**/*.ts</｜DSML｜ parameter>
+</｜DSML｜ invoke>
 <｜DSML｜ invoke name="grep">
-<｜DSML｜ parameter name="pattern" string="true">TODO
+<｜DSML｜ parameter name="pattern" string="true">TODO</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
 
 non-string values:
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="todowrite">
-<｜DSML｜ parameter name="todos" string="false">[{"content": "make init", "status": "in_progress", "priority": "high"}]
+<｜DSML｜ parameter name="todos" string="false">[{"content": "make init", "status": "in_progress", "priority": "high"}]</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
 </good_examples>
 
 <critic>
@@ -670,10 +724,16 @@ def _dsml_arg_to_json(key, raw, is_str):
     return f"{json.dumps(key, ensure_ascii=False)}: {raw}"
 
 
+_CLOSE_TAG_RE = re.compile(r"</" + re.escape(DSML_TOKEN) + r"\s*(?:calls|invoke|parameter)\s*>")
+_INVOKE_CLOSE_RE = re.compile(r"</" + re.escape(DSML_TOKEN) + r"\s*invoke\s*>")
+
+
 def _parse_dsml_block(block):
     """Parse the inside of one <DSML calls> block: one <DSML invoke> per call,
-    each followed by <DSML parameter name= string=>value lines. Those tags are
-    never closed, so a value runs until the next parameter/invoke or block end."""
+    each followed by <DSML parameter name= string=>value lines. Every tag is
+    closed, so a value ends at its </DSML parameter> and a call at
+    </DSML invoke>; a missing closer is tolerated and the value then runs until
+    the next parameter/invoke or block end."""
     calls = []
     invocations = list(_INVOKE_RE.finditer(block))
     for i, inv in enumerate(invocations):
@@ -681,11 +741,17 @@ def _parse_dsml_block(block):
         if not name:
             continue
         stop = invocations[i + 1].start() if i + 1 < len(invocations) else len(block)
+        closing = _INVOKE_CLOSE_RE.search(block, inv.end(), stop)
+        if closing is not None:
+            stop = closing.start()
         segment = block[inv.end():stop]
         pairs = []
         params = list(_PARAM_RE.finditer(segment))
         for j, prm in enumerate(params):
             pend = params[j + 1].start() if j + 1 < len(params) else len(segment)
+            closing = _CLOSE_TAG_RE.search(segment, prm.end())
+            if closing is not None:
+                pend = min(pend, closing.start())
             raw = _strip_cdata(segment[prm.end():pend]).strip("\r\n")
             is_str = prm.group(2).lower() == "true"
             if not is_str:
@@ -698,11 +764,19 @@ def _parse_dsml_block(block):
 
 def parse_tool_call_blocks(text):
     """Parse every <DSML calls> block in the text into OpenAI tool_calls.
-    Parallel calls are several <DSML invoke> entries inside one block."""
+    A block ends at its </DSML calls> tag when the model wrote one, otherwise at
+    the next block or the end of the text. Parallel calls are several <DSML
+    invoke> entries inside one block."""
     calls = []
     for m in re.finditer(re.escape(DSML_CALLS_OPEN), text):
+        end = len(text)
         nxt = text.find(DSML_CALLS_OPEN, m.end())
-        calls.extend(_parse_dsml_block(text[m.end():nxt if nxt != -1 else len(text)]))
+        if nxt != -1:
+            end = nxt
+        close = text.find(DSML_CALLS_CLOSE, m.end())
+        if close != -1:
+            end = min(end, close)
+        calls.extend(_parse_dsml_block(text[m.end():end]))
     return calls
 
 
@@ -717,16 +791,18 @@ def tool_call_dsml(name, arguments):
     for k, v in (arguments or {}).items():
         is_str = isinstance(v, str)
         value = v if is_str else json.dumps(v, ensure_ascii=False)
-        lines.append(f'<{DSML_TOKEN} parameter name="{k}" string="{"true" if is_str else "false"}">{value}')
-    return DSML_CALLS_OPEN + "\n" + "\n".join(lines)
+        lines.append(f'<{DSML_TOKEN} parameter name="{k}" string="{"true" if is_str else "false"}">{value}</{DSML_TOKEN} parameter>')
+    lines.append(f"</{DSML_TOKEN} invoke>")
+    return DSML_CALLS_OPEN + "\n" + "\n".join(lines) + "\n" + DSML_CALLS_CLOSE
 
 
 class ToolStreamBuffer:
     """Streams visible text and captures <DSML calls> blocks, converting them to
-    OpenAI tool_calls. DSML tags are never closed, so a block counts as finished
-    when the next one starts or at flush() (end of stream). A block that does not
-    parse as a tool call is released back as plain text, so nothing is lost when
-    the model merely mentions the markup in prose."""
+    OpenAI tool_calls. A block normally ends at </DSML calls>, so it is finished
+    as soon as that tag arrives; an unterminated block is finished at flush()
+    (end of stream). A block that does not parse as a tool call is released back
+    as plain text, so nothing is lost when the model merely mentions the markup
+    in prose."""
 
     def __init__(self):
         self.buf = ""
@@ -955,26 +1031,14 @@ def collect_image_parts(messages):
     return out
 
 
-def map_thinking(reasoning_effort, enable_search=None, model=None):
-    """OpenAI reasoning_effort -> DeepSeek's two independent site toggles.
+def map_thinking(model=None):
+    """Pick DeepSeek's two independent site toggles.
 
-    DeepSeek sends "thinking" and "search" as separate booleans, not as a
-    single effort level. An explicit effort always wins; with no effort at all
-    only the reasoner thinks, which is how the web UI behaves (Instant ships
-    with DeepThink off). The z.ai original defaulted to "max" here, which made
-    every plain request emit reasoning."""
-    eff = (reasoning_effort or "").strip().lower()
-    if eff in ("none", "off", "disabled", "minimal", "low"):
-        thinking = False
-    elif eff in ("medium", "high", "max"):
-        thinking = True
-    else:
-        thinking = (model == "deepseek-reasoner")
-    if enable_search is None:
-        search = eff in ("", "low", "minimal")
-    else:
-        search = bool(enable_search)
-    return thinking, search
+    The site has no reasoning-effort concept at all: DeepThink is a plain
+    on/off switch in the composer, and which model you asked for decides it -
+    deepseek-reasoner thinks, deepseek-chat does not. Web search is always
+    off: the request field is ignored and the toggle is never enabled."""
+    return (model == "deepseek-reasoner"), False
 
 
 # History rendering is kept 1:1 with the z.ai original (build_prompt): OpenAI
@@ -1560,8 +1624,7 @@ class DeepSeekSession:
         await self._open_chat()
         # _open_chat raises unless the page is genuinely signed in, so
         # reaching this line really does mean we have a session
-        log(f"[browser] worker #{self.worker_id} up, account "
-            f"'{self._label(self.account_idx)}' authenticated")
+        log(f"[browser] worker #{self.worker_id} up")
 
     async def _early_hide(self):
         # the top-level window materialises a few ms after launch returns
@@ -1792,9 +1855,8 @@ class DeepSeekSession:
         thinking, search = bool(thinking), bool(search)
         self._search = search
         try:
-            got = await self.page.evaluate(
+            await self.page.evaluate(
                 SET_TOGGLES_JS, {"thinking": thinking, "search": search})
-            log(f"[prefs] deepthink={thinking} search={search} -> {got}")
         except Exception as e:
             log(f"[prefs] toggle click failed: {e}", level="WARN")
         await asyncio.sleep(0.4)
@@ -1895,8 +1957,6 @@ class DeepSeekSession:
             if len(raw) > last_len:
                 if not started:
                     started = True
-                    log("[stream] completion XHR opened "
-                        f"(xhr.responseType={snap.get('responseType')!r})")
                 last_len = len(raw)
                 last_growth = time.time()
                 for line in raw[consumed:].splitlines():
@@ -2238,12 +2298,10 @@ async def chat_completions(request: Request):
     # DeepSeek merged Instant/Expert/Vision into one multimodal model, so image
     # parts are attached for every model, not just deepseek-vision.
     images = collect_image_parts(messages)
-    thinking, search = map_thinking(body.get("reasoning_effort"),
-                                   body.get("enable_search"), req_model)
+    thinking, search = map_thinking(req_model)
     prompt_len = len(prompt)
     log(f"<-- request: history msgs={len(messages)} prompt_len={prompt_len} "
-        f"| model={req_model} ({model_type}) thinking={thinking} search={search} "
-        f"images={len(images)}")
+        f"| model={req_model}")
 
     def sse(obj):
         return f"data: {json.dumps(obj)}\n\n"
