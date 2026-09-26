@@ -19,6 +19,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
+try:
+    # DeepSeek's own tokenizer, so usage counts match what the site bills.
+    # Optional: without it we fall back to the ~4 chars/token estimate.
+    from deepseek_tokenizer import ds_token
+except Exception:  # pragma: no cover - depends on the install
+    ds_token = None
+
 # ===== CONFIG =====
 TOKEN = ""
 HOST = "127.0.0.1"
@@ -1232,16 +1239,24 @@ class StreamState:
 
     # -- emit -----------------------------------------------------------
     def _diff(self, kind, text):
-        """Publish only what is new since the last call for this field."""
+        """Publish the part of the site's current text not published yet.
+
+        `text` is always the site's authoritative view of the channel, and the
+        site REPLAYS its stream from the start: the same channel text arrives
+        again as a short prefix while the live tail keeps growing. So a `text`
+        at or below the high-water mark is content the client already has.
+
+        Resending the whole field in that case replayed entire blocks of the
+        answer to the client verbatim, and diffing on the common prefix instead
+        made `full` grow without bound (thinking reached 579931 chars for a
+        one-line puzzle) because the site oscillates between replayed head and
+        live tail. A high-water mark is monotonic by construction.
+        """
         if not text:
             return None
         self.full[kind] = text
         n = self.sent[kind]
-        if len(text) < n:
-            # field shrank (regenerate / snapshot overwrote): resend whole thing
-            self.sent[kind] = len(text)
-            return (kind, text)
-        if len(text) == n:
+        if len(text) <= n:
             return None
         self.sent[kind] = len(text)
         return (kind, text[n:])
@@ -1390,7 +1405,7 @@ class StreamState:
                               ("content", "answer")):
                 val = delta.get(key)
                 if isinstance(val, str) and val:
-                    got = self._diff(kind, self.full[kind] + val)
+                    got = self._diff(kind, (self.full.get(kind) or "") + val)
                     if got:
                         out.append(got)
             if ch.get("finish_reason"):
@@ -1523,7 +1538,7 @@ class StreamState:
         if isinstance(val, str):
             kind = ("thinking" if ("thinking" in path or "reasoning" in path)                    else "answer" if "content" in path else None)
             if kind:
-                text = val if op in ("SET", "REPLACE") else self.full[kind] + val
+                text = val if op in ("SET", "REPLACE") else (self.full.get(kind) or "") + val
                 got = self._diff(kind, text)
                 if got:
                     out.append(got)
@@ -1940,6 +1955,7 @@ class DeepSeekSession:
         'thinking' | 'answer' | 'error' | 'done'."""
         st = StreamState()
         consumed = 0
+        pending = ""
         last_len = 0
         last_growth = time.time()
         started = False
@@ -1957,17 +1973,36 @@ class DeepSeekSession:
             if len(raw) > last_len:
                 if not started:
                     started = True
-                last_len = len(raw)
                 last_growth = time.time()
-                for line in raw[consumed:].splitlines():
+                chunk = raw[consumed:]
+                consumed = last_len
+                # One SSE frame can straddle a poll, and after a stall the
+                # frame that gets split is usually the LAST one, so there is no
+                # later snapshot to resend the text and it is lost for good.
+                # feed_line() drops unparseable JSON without a sound, so
+                # consuming the head of a split frame loses the head, and the
+                # tail arrives next poll with no "data:" prefix to parse. Only
+                # whole lines are consumed; the remainder waits in `pending`.
+                cut = chunk.rfind("\n")
+                if cut >= 0:
+                    block = pending + chunk[:cut + 1]
+                    pending = chunk[cut + 1:]
+                else:
+                    pending += chunk
+                    block = ""
+                for line in block.splitlines():
                     for kind, delta in st.feed_line(line):
                         yield kind, delta
-                consumed = last_len
 
             if st.error:
                 yield "error", str(st.error)
                 return
             if st.finished:
+                # A final frame is allowed to arrive without a trailing
+                # newline, so do not discard what is left in `pending`.
+                if pending.strip():
+                    for kind, delta in st.feed_line(pending):
+                        yield kind, delta
                 yield "done", ""
                 return
 
@@ -2193,16 +2228,34 @@ def make_chunk(chunk_id, created, model, delta, finish_reason=None):
     }
 
 
-def _msg_chars(m):
+CHARS_PER_TOKEN = 4   # only used when deepseek-tokenizer is not installed
+
+
+def _tok(text):
+    """Token count for a string. Uses DeepSeek's own tokenizer when it is
+    installed - it is a pure-Python BPE but still does ~1 MB/s, so a 40k-char
+    prompt costs ~30ms. Falls back to the usual ~4 chars/token estimate."""
+    if not text:
+        return 0
+    if ds_token is not None:
+        try:
+            return len(ds_token.encode(text, add_special_tokens=False))
+        except Exception as e:
+            log(f"[usage] tokenizer failed ({e}) - falling back to chars/"
+                f"{CHARS_PER_TOKEN}", level="WARN")
+    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+
+
+def _msg_tokens(m):
     try:
-        return len(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
+        return _tok(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
     except Exception:
-        return len(str(m))
+        return _tok(str(m))
 
 
-def _non_text_part_chars(m):
-    """Chars contributed by image / audio content parts inside a message."""
-    image_chars = audio_chars = 0
+def _non_text_part_tokens(m):
+    """Tokens contributed by image / audio content parts inside a message."""
+    image_tokens = audio_tokens = 0
     content = m.get("content")
     if isinstance(content, list):
         for part in content:
@@ -2210,37 +2263,38 @@ def _non_text_part_chars(m):
                 continue
             t = part.get("type")
             if t == "image_url":
-                image_chars += _msg_chars(part.get("image_url") or {})
+                image_tokens += _msg_tokens(part.get("image_url") or {})
             elif t == "input_audio":
-                audio_chars += _msg_chars(part.get("input_audio") or {})
-    return image_chars, audio_chars
+                audio_tokens += _msg_tokens(part.get("input_audio") or {})
+    return image_tokens, audio_tokens
 
 
 def build_usage(messages, full_reasoning, full_answer):
-    """Char counts (1 token := 1 character), matching the site's
-    ~2M real limit which is made of characters. Output follows the standard
+    """Token counts at ~4 chars/token. The whole history is on our side (it is
+    echoed back in the request), so one uniform rule covers it - there is
+    nothing to reconcile with an upstream counter. Output follows the standard
     OpenAI usage shape (prompt_tokens_details / completion_tokens_details):
     - prompt_tokens   = every non-assistant message (user/system/developer/
-        tool/function ...) serialized as JSON, incl. image/audio chars;
+        tool/function ...) serialized as JSON, incl. image/audio parts;
     - completion_tokens = every assistant message serialized as JSON (incl.
         tool_calls) + the newly generated reasoning/answer.
     """
     prompt_text = prompt_image = prompt_audio = completion_hist = 0
     for m in messages or []:
-        n = _msg_chars(m)
+        n = _msg_tokens(m)
         if (m.get("role") or "unknown") == "assistant":
             completion_hist += n
         else:
             prompt_text += n
-        img, aud = _non_text_part_chars(m)
+        img, aud = _non_text_part_tokens(m)
         prompt_image += img
         prompt_audio += aud
     prompt_image = min(prompt_image, prompt_text)
     prompt_audio = min(prompt_audio, prompt_text - prompt_image)
 
-    reasoning_est = sum(len(x) for x in full_reasoning)
-    answer_est = sum(len(x) for x in full_answer)
-    completion_len = completion_hist + reasoning_est + answer_est
+    reasoning_tok = _tok("".join(full_reasoning or []))
+    answer_tok = _tok("".join(full_answer or []))
+    completion_len = completion_hist + reasoning_tok + answer_tok
 
     return {
         "prompt_tokens": prompt_text,
@@ -2256,7 +2310,7 @@ def build_usage(messages, full_reasoning, full_answer):
         },
         "completion_tokens": completion_len,
         "completion_tokens_details": {
-            "reasoning_tokens": reasoning_est,
+            "reasoning_tokens": reasoning_tok,
             "accepted_prediction_tokens": 0,
             "rejected_prediction_tokens": 0,
             "audio_tokens": 0,
@@ -2363,8 +2417,10 @@ async def chat_completions(request: Request):
                         visible = delta
                         if tool_buf is not None:
                             visible, calls_batch = tool_buf.feed(delta)
-                        else:
-                            full_answer.append(delta)
+                        # Only `visible` is accumulated: with no tool buffer it
+                        # IS delta, and appending delta in an else branch too
+                        # counted every chunk twice, inflating the answer length
+                        # in the log, in last_response.json and in usage.
                         if visible:
                             answer_started = True
                             full_answer.append(visible)
