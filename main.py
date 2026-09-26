@@ -24,6 +24,7 @@ TOKEN = ""
 HOST = "127.0.0.1"
 PORT = 8493
 CHAT_URL = "https://chat.deepseek.com/"
+SIGN_IN_URL = "https://chat.deepseek.com/sign_in"
 FALLBACK_MODEL = "deepseek-chat"
 
 # NOTE: there is deliberately no model_type table here. DeepSeek merged
@@ -35,9 +36,9 @@ FALLBACK_MODEL = "deepseek-chat"
 DEFAULT_MODEL_TYPE = "default"
 
 # ===== STARTUP MENU STATE (toggled from the console before launch) =====
-# CAPTCHA_BYPASS = True            # [2] reload same account & retry when a captcha appears
 ACCOUNT_ROTATE = True              # [3] rotate between accounts after rotate_every requests
 HEADLESS = True                    # [6] hide the browser window (True = hidden, default on)
+AUTO_REFRESH = True                # [2] re-login with email/password when a token goes stale
 REQUEST_COOLDOWN = 0               # seconds between requests
 TOOL_CALL_DELAY = 0.5              # seconds between parallel tool-call chunks, avoids Busy errors in the client
 MAX_REQUEST_RETRIES = 4            # max retries per request before giving up
@@ -447,6 +448,82 @@ LOGIN_WALL_JS = """
     }
 """
 
+# DeepSeek has no refresh_token endpoint: a token is simply rotated server-side
+# and the old one dies. The only reliable "is it still good?" probe is asking an
+# authenticated endpoint. chat_session/create answers HTTP 200 with
+# {"code":40003,"msg":"Authorization Failed (invalid token)"} for a dead token,
+# and a real session id for a live one - so code === 0 means valid.
+TOKEN_PROBE_JS = """
+    async (token) => {
+        try {
+            const r = await fetch('/api/v0/chat_session/create', {
+                method: 'POST',
+                headers: {'content-type': 'application/json',
+                          'authorization': 'Bearer ' + token},
+                body: '{}',
+            });
+            const j = await r.json();
+            return {ok: j.code === 0, code: j.code, msg: j.msg || ''};
+        } catch (e) {
+            return {ok: false, code: -1, msg: String(e)};
+        }
+    }
+"""
+
+# The session lives in localStorage, not a cookie: userToken -> {"value": ...}
+SESSION_TOKEN_JS = """
+    () => {
+        try {
+            const raw = localStorage.getItem('userToken');
+            if (!raw) return '';
+            const v = JSON.parse(raw).value;
+            return typeof v === 'string' ? v : '';
+        } catch (e) { return ''; }
+    }
+"""
+
+# True once the composer is on screen AND we are not looking at the sign-in
+# wall - i.e. the browser really is signed in.
+AUTHED_CHAT_JS = """
+    () => !!(document.querySelector('textarea[name="search"]')
+             || document.querySelector('textarea'))
+"""
+
+# DeepSeek replaces the whole chat UI with a policy notice when an account is
+# suspended, so there is no composer at all. Detecting it turns a baffling
+# "never rendered the composer" into the actual reason.
+SUSPENDED_JS = """
+    () => {
+        const t = (document.body.innerText || '').replace(/\\s+/g, ' ');
+        const m = t.match(/account has been suspended[^.]*\\.?/i);
+        return m ? m[0].trim() : '';
+    }
+"""
+
+EMAIL_INPUT_SEL = 'input[placeholder="Phone number / email address"]'
+PASSWORD_INPUT_SEL = 'input[type="password"]'
+LOGIN_BUTTON_SEL = 'div.ds-button--primary:has-text("Log in")'
+LOGIN_FORM_READY_JS = """
+    () => {
+        const e = document.querySelector('input[placeholder="Phone number / email address"]');
+        const p = document.querySelector('input[type=password]');
+        return !!(e && e.offsetParent && p && p.offsetParent);
+    }
+"""
+
+# Every login rotates the account token and kills the previous one, so two
+# workers recovering the same account at the same time would invalidate each
+# other's fresh session. Serialise logins and re-check under the lock: whoever
+# waits picks up the token the winner just saved.
+_AUTH_LOCK = None
+
+
+def _auth_lock():
+    global _AUTH_LOCK
+    if _AUTH_LOCK is None:
+        _AUTH_LOCK = asyncio.Lock()
+    return _AUTH_LOCK
+
 STOP_GENERATION_JS = """
     () => {
         for (const b of document.querySelectorAll('button')) {
@@ -464,7 +541,7 @@ STOP_GENERATION_JS = """
 
 # Injected right after "# History ..." header as a final system line when tools
 # are used. Edit the text freely - the proxy injects it verbatim.
-FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>. See <tool_call_format>. NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response. NEVER write \\n - this does NOT work. Function name goes right after <tc>, each argument is <ak>key</ak><av>value</av>. Values go directly inside <av>...</av> without quotes. NEVER output JSON keys role, content, thinking, name, tool_call_id, tool, user, ... as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks. Your reply is plain text, optionally with <tc>...</tc> blocks."""
+FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - the ONLY valid tool call format is DSML: a <｜DSML｜ calls> block holding <｜DSML｜ invoke name="TOOL"> and <｜DSML｜ parameter name="KEY" string="true|false">VALUE. See <tool_call_format>. NEVER write anything after the <｜DSML｜ calls> block; it must ALWAYS be at the end of your response. NEVER output JSON keys role, content, thinking, name, tool_call_id, tool, user, ... as your reply. Your reply is plain text, optionally with a <｜DSML｜ calls> block."""
 
 SYSTEM_CONTINUE = 'This is a forwarded conversation.'
 
@@ -476,216 +553,79 @@ TOOL_PROMPT_TEMPLATE = """ # You have access to these tools:
 
 TOOL_INSTRUCTIONS = """# Tool Call Instructions
 <tool_call_format>
+The ONLY tool-call format is DSML. Ignore every other format you may know - markup tags, bare JSON objects with a "name" key, and any other invented scheme are all WRONG here. A tool call is a <｜DSML｜ calls> block.
 
-See the <priorities>, <bad_examples>, <good_examples>, <examples>, <rules> and <critic> sections.
-IMPORTANT: Ignore all built-in, hidden, native and platform tools. The ONLY tools you may use are the explicit names listed in the <allowed_tools>. Never invent tools, never say resources are exhausted, never repeat the same command in a row. This is the only source on how to use the tools. All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>.
+One call, one string parameter:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true">$PARAMETER_VALUE
 
- # Tool Call Format:
-A tool call is ONE single-line <tc>...</tc> block. The function name comes right after the opening tag; every argument is ONE <ak>...</ak> pair followed by ONE <av>...</av> pair:
-<tc>TOOL_NAME_HERE<ak>param_name</ak><av>value</av></tc>
+One call, several parameters:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="param_name" string="true">value
+<｜DSML｜ parameter name="count" string="false">5
 
-A call with several arguments:
-<tc>TOOL_NAME_HERE<ak>param_name</ak><av>value</av><ak>param_name2</ak><av>value2</av></tc>
-
-CRITICAL: every call MUST be exactly one <tc>...</tc> block. The function name comes right after the opening tag; every argument is ONE <ak>...</ak> pair followed by ONE <av>...</av> pair. A bare JSON object, a {"name": ...} wrapper and <tools> tags are NOT tool calls and will be ignored.
-String argument values are written RAW, without quotes: <av>hello</av>. Non-string values use JSON: lists <av>[1, 2]</av>, objects <av>{"a": 1}</av>, numbers <av>42</av>, booleans <av>true</av>, null <av>null</av>. If the tool takes no arguments, write only the name: <tc>clear</tc>.
+Several calls in one turn = one <｜DSML｜ invoke> per tool, all inside ONE <｜DSML｜ calls> block:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="TOOL_NAME_1">
+<｜DSML｜ parameter name="p" string="true">v
+<｜DSML｜ invoke name="TOOL_NAME_2">
+<｜DSML｜ parameter name="p" string="true">v
 
 <rules>
- # Rules:
-- You may write ONLY: (1) normal prose/answer text, and (2) <tc>...</tc> blocks. Nothing else in any structured format.
-- Tool results are delivered by the ENVIRONMENT as history lines {"role": "tool", "name": "...", "content": "<tool_response>...</tool_response>"}. 
-- The function name MUST be an exact tool name from the list; argument keys MUST match that tool's Parameters schema exactly. Every <ak> MUST be followed by its <av>.
-- DONT use <tool_call>, <arg_key>, <arg_value>. In this tool call format: <tool_call> is <tc>, <arg_key> is <ak>, <arg_value> is <av>.
-- NEVER output JSON keys role, content, thinking, name, tool_call_id, tool, user, ... as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks.
-- Use only THOSE tools that are listed in <allowed_tools>.
-- If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
-- Multiple tool calls = SEVERAL separate <tc> blocks, one tool call per block, so a broken block never kills the rest:
-
-<tc>TOOL_NAME_HERE1<ak>param_name1</ak><av>value1</av></tc>
-<tc>TOOL_NAME_HERE2<ak>param_name2</ak><av>value2</av></tc>
-
-- If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
-- Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\) - raw backslashes no longer break anything, but keep writing them doubled.
-- Raw inner quotes in string values are fine, they are plain text inside <av>: <av>rg -n "pattern" src/</av>.
-- Don't break anything, even if you've already broken it in the chat history.
-- Don't write "The user reported ..." and similar phrases.
-- NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response.
-- NEVER write \\n - this does NOT work.
-- It is recommended to use a colon to indicate that you are calling the tool:
-
-Now I will read:
-<tc>read<ak>filePath</ak><av>/project/file.txt</av></tc>
-
+# Rules:
+- A string parameter is written RAW, exactly as-is, with string="true".
+- Every other type (number, boolean, array, object, null) is written as JSON with string="false": <｜DSML｜ parameter name="n" string="false">42, <｜DSML｜ parameter name="b" string="false">true, <｜DSML｜ parameter name="a" string="false">[1, 2], <｜DSML｜ parameter name="o" string="false">{"a": 1}.
+- A tool with no parameters is just <｜DSML｜ invoke name="clear">.
+- These tags have NO closing tag. A parameter value runs until the next <｜DSML｜ parameter>, the next <｜DSML｜ invoke>, or the end of the block.
+- Parameter names MUST match that tool's schema exactly, and the tool name MUST be one of the <allowed_tools>.
+- NEVER write anything after the <｜DSML｜ calls> block.
+- Tool results arrive as <tool_result>...</tool_result> history lines.
 </rules>
 
- # Incorrect:
 <bad_examples>
-<tc>bash<arg_key>command</arg_key><arg_value>dir</arg_value></tc>   <- native GLM tags get stripped by site, use <tc>/<ak>/<av>
-<tc>bash<ak>command</ak></tc>                                                     <- missing </av>
-<tc>bash<av>dir</av></tc>                                                         <- missing <ak>
-<tc>bash<ak>command</ak><av>dir</tc>                                              <- missing closing </av>
-<tc><ak>command</ak><av>dir</av></tc>                                             <- missing function name
-<tc>bash<ak>command</ak><av>"dir"</av></tc>                                       <- values must not be JSON-quoted
-I'll read it now...: (nothing)                                                    <- narrated instead of calling
-<tc>bash<ak>command</ak><av>rg -n "p</av></tc>                                    <- unterminated value
+{"name": "bash", "arguments": {"command": "dir"}}<- bare JSON is not a tool call
+<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="false">"dir"   <- a string value must not be JSON-quoted
+I'll read it now...                                                                  <- narrated instead of calling
 </bad_examples>
 
- # Correct:
 <good_examples>
-single call - brief prose if needed, then ONE block on its own line, then STOP completely:
-Let me read that file:
-<tc>read<ak>filePath</ak><av>/project/file.txt</av></tc>
+single call:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="read">
+<｜DSML｜ parameter name="filePath" string="true">/project/file.txt
 
-parallel calls - SEVERAL separate blocks, one tool call per block, stop right after:
-<tc>glob<ak>pattern</ak><av>**/*.ts</av></tc>
-<tc>grep<ak>pattern</ak><av>TODO</av></tc>
+parallel calls:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="glob">
+<｜DSML｜ parameter name="pattern" string="true">**/*.ts
+<｜DSML｜ invoke name="grep">
+<｜DSML｜ parameter name="pattern" string="true">TODO
 
-/ paths - recommended:
-<tc>read<ak>filePath</ak><av>/Project/file.h</av></tc>
-
-non-string values - lists, objects, numbers:
-<tc>todowrite<ak>todos</ak><av>[{"content": "make init", "status": "in_progress", "priority": "high"}, {"content": "make debug", "status": "pending", "priority": "medium"}]</av></tc>
+non-string values:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="todowrite">
+<｜DSML｜ parameter name="todos" string="false">[{"content": "make init", "status": "in_progress", "priority": "high"}]
 </good_examples>
 
-<examples>
- # Examples (*If you are running in the OpenCode CLI):
-
-<tc>bash<ak>command</ak><av>git status --short</av></tc>
-<tc>read<ak>filePath</ak><av>project/main.py</av></tc>
-<tc>write<ak>filePath</ak><av>project/helper.py</av><ak>content</ak><av>def add(a, b):\\n\\treturn a + b
-</av></tc>
-<tc>edit<ak>filePath</ak><av>project/main.py</av><ak>oldString</ak><av>def old_fn():\\n\\tpass</av><ak>newString</ak><av>def new_fn():\n\treturn True</av></tc>
-<tc>glob<ak>pattern</ak><av>**/*.cpp</av></tc>
-<tc>grep<ak>pattern</ak><av>MyClass</av><ak>path</ak><av>project/scripts</av></tc>
-<tc>list<ak>path</ak><av>project/</av></tc>
-<tc>todowrite<ak>todos</ak><av>[{"content": "make init", "status": "in_progress", "priority": "high"}, {"content": "make debug", "status": "pending", "priority": "medium"}]</av></tc>
-<tc>webfetch<ak>url</ak><av>https://example.com/docs</av><ak>format</ak><av>markdown</av></tc>
-
-</examples>
-
- # Critic check
 <critic>
-Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? function name placed right after <tc>? every <ak> followed by its <av>? strings written RAW, non-strings as JSON? one tool call per block, never bundled? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
+Before you send: is it a <｜DSML｜ calls> block? one <｜DSML｜ invoke> per tool? does every parameter carry name= and string=? are strings raw with string="true" and everything else JSON with string="false"? do the names match the schema and <allowed_tools>? is there nothing after the block?
 </critic>
 
- # <tc> work
-How your response chain works from the user's perspective:
-
- +---- User message
- | (trigger)
- +---> Your previous text with <tc> block
- | (result)
- | (trigger)
- +---> Your previous text with <tc> block
- | (result)
- | (trigger)
- +---> A new request for you regarding the continuation
- |
- +---> If there's no <tc> block — that's it!
-
-result - <tool_response>
-trigger - a new request for you to take the following action
-
- # Priorities:
 <priorities>
 1. The <rules>
 2. The <bad_examples>, <good_examples> and <critic>
-3. The <examples>
-4. Purpose/User Message
+3. Purpose/User Message
 </priorities>
 </tool_call_format>"""
 
 
-def _glm_arg_value(v):
-    """Render one argument value: strings stay raw, everything else as JSON."""
-    if isinstance(v, str):
-        return v
-    return json.dumps(v, ensure_ascii=False)
-
-
-def tool_call_xml(name, arguments):
-    """History re-injection: OpenAI tool_call -> <tc>NAME<ak>K</ak><av>V</av></tc>."""
-    if not arguments:
-        return f"<tc>{name}</tc>"
-    inner = "".join(
-        f"<ak>{k}</ak><av>{_glm_arg_value(v)}</av>" for k, v in (arguments or {}).items()
-    )
-    return f"<tc>{name}{inner}</tc>"
-
-
-def _unquote_val(v):
-    """Strip wrapping quotes around a repaired string value:
-    <av>"dir"</av> -> dir. JSON-looking values ({..}, [..], numbers) pass through."""
-    v = v.strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
-        return v[1:-1].strip()
-    return v
-
-
-def _parse_xml_call(inner):
-    """Parse XML tool call body: NAME<ak>K</ak><av>V</av>... (keys/vals repeat).
-    Tolerant: missing </ak>/</av>, missing <av>-value or stray quotes around
-    values are repaired instead of failing the whole call."""
-    m = re.match(r"^\s*([^<]*?)\s*<ak>", inner)
-    if not m:
-        return None
-    name = m.group(1).strip()
-    if not name:
-        return None
-    body = inner[m.end() - 4:]  # rewind to the first <ak>
-
-    tokens = re.split(r"(<ak>|</ak>|<av>|</av>)", body)
-    args = {}
-    key = None
-    chunk = ""
-    in_key = False
-    in_val = False
-
-    def flush_key():
-        """Promote the accumulated chunk into a pending key (no closing </ak>)."""
-        return chunk.strip()
-
-    def commit():
-        nonlocal key, chunk, in_key, in_val
-        k = key if key is not None else flush_key()
-        k = k.strip()
-        if k:
-            args[k] = _unquote_val(chunk)
-        key, chunk = None, ""
-        in_key = in_val = False
-
-    for tok in tokens:
-        if not tok:
-            continue
-        if tok == "<ak>":
-            if in_val or in_key:
-                commit()  # close previous (possibly incomplete) pair
-            in_key, in_val = True, False
-            chunk = ""
-        elif tok == "</ak>":
-            if in_key:
-                key = chunk.strip()
-                chunk = ""
-                in_key = False
-        elif tok == "<av>":
-            if in_key:
-                key = chunk.strip()  # missing </ak> -> key is whatever came before
-            in_val, in_key = True, False
-            chunk = ""
-        elif tok == "</av>":
-            if in_val:
-                commit()
-        elif in_key or in_val:
-            chunk += tok
-
-    if in_val:
-        commit()  # unterminated trailing value
-    elif key or in_key:
-        commit()  # trailing key without value -> empty value
-
-    if not args:
-        return None
-    return {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
+DSML_TOKEN = "\uff5cDSML\uff5c"
+DSML_CALLS_OPEN = "<" + DSML_TOKEN + " calls>"
+DSML_CALLS_CLOSE = "</" + DSML_TOKEN + " calls>"
+_INVOKE_RE = re.compile(r"<" + re.escape(DSML_TOKEN) + r' invoke(?:\s+name="([^"]*)")?\s*>')
+_PARAM_RE = re.compile(r"<" + re.escape(DSML_TOKEN) + r' parameter\s+name="([^"]*)"\s+string="([^"]*)"\s*>')
 
 
 def _strip_cdata(v):
@@ -693,66 +633,100 @@ def _strip_cdata(v):
 
 
 def render_tools_block(tools):
-    """Render the tool list literally as OpenAI-API style JSON: a {"tools": [...]}
-    array, each entry a {"type": "function", "function": {...}} object."""
-    return json.dumps({"tools": tools}, ensure_ascii=False, indent=2)
+    """DeepSeek expects one JSON function schema per line under
+    '### Available Tool Schemas' - not an OpenAI {"tools": [...]} wrapper."""
+    return "\n".join(
+        json.dumps(t.get("function") or t, ensure_ascii=False) for t in tools
+    )
 
 
-def normalize_tool_tags(text):
-    """Safety net: map native GLM tool-call tags to ours. GLM sometimes emits
-    <tool_call>/<arg_key>/<arg_value> (and <command> for bash) instead of the
-    <tc>/<ak>/<av> we asked for. Everything is converted BEFORE parsing."""
-    if "<tool_call>" in text or "<arg_key>" in text or "<arg_value>" in text or "<command>" in text:
-        text = text.replace("<tool_call>", "<tc>")\
-                   .replace("</tool_call>", "</tc>")\
-                   .replace("<tool_calls>", "<tc>")\
-                   .replace("</tool_calls>", "</tc>")\
-                   .replace("<arg_key>", "<ak>")\
-                   .replace("</arg_key>", "</ak>")\
-                   .replace("<arg_value>", "<av>")\
-                   .replace("</arg_value>", "</av>")\
-                   .replace("<akcmd>", "<ak>")\
-                   .replace("<command>", "<ak>command</ak><av>")\
-                   .replace("</command>", "</av>")
-    return text
-
-
-def parse_tool_call_blocks(text):
-    """Parse tool calls from ALL <tc>...</tc> blocks. The only form is native
-    GLM XML: NAME<ak>K</ak><av>V</av>... (keys/vals repeat). Bare-name form
-    <tc>name</tc> is a tool with no arguments. Parallel calls = several blocks.
-    Native GLM tags (<tool_call>/<arg_key>/<arg_value>/<command>) are
-    auto-converted to ours before parsing."""
-    text = normalize_tool_tags(text)
-    # Repair: an unclosed <tc> at the very end (stream cut / truncated reply)
-    # gets closed so the call is not lost.
-    if text.count("<tc>") > text.count("</tc>"):
-        text = text + "</tc>"
-    calls = []
-    blocks = list(re.finditer(r"<tc>\s*([\s\S]*?)\s*</tc>", text))
-    for m in blocks:
-        inner = m.group(1).strip()
-        if "<ak>" in inner:
-            call = _parse_xml_call(inner)
-            if call:
-                calls.append(call)
+def _trim_to_json_prefix(raw):
+    """A string="false" value must be JSON, but a model that ignores the
+    'nothing after the block' rule appends prose. Keep the longest prefix that
+    still parses, so the trailing sentence does not corrupt the argument."""
+    raw = raw.strip()
+    if not raw:
+        return raw
+    try:
+        json.loads(raw)
+        return raw
+    except Exception:
+        pass
+    for end in range(len(raw), 0, -1):
+        try:
+            json.loads(raw[:end])
+            return raw[:end]
+        except Exception:
             continue
-        if re.fullmatch(r"[A-Za-z0-9_.\-]+", inner):
-            calls.append({"name": inner, "arguments": "{}"})
-        else:
-            log(f"[tools] invalid <tc> block skipped: {inner[:120]}", level="WARN")
+    return raw
+
+
+def _dsml_arg_to_json(key, raw, is_str):
+    """One 'key: value' pair. string="true" -> the value is a raw string and gets
+    JSON-encoded; string="false" -> the value is already JSON and is used as-is.
+    Mirrors decode_dsml_to_arguments() in DeepSeek's own encoding.py."""
+    if is_str:
+        raw = json.dumps(raw, ensure_ascii=False)
+    return f"{json.dumps(key, ensure_ascii=False)}: {raw}"
+
+
+def _parse_dsml_block(block):
+    """Parse the inside of one <DSML calls> block: one <DSML invoke> per call,
+    each followed by <DSML parameter name= string=>value lines. Those tags are
+    never closed, so a value runs until the next parameter/invoke or block end."""
+    calls = []
+    invocations = list(_INVOKE_RE.finditer(block))
+    for i, inv in enumerate(invocations):
+        name = (inv.group(1) or "").strip()
+        if not name:
+            continue
+        stop = invocations[i + 1].start() if i + 1 < len(invocations) else len(block)
+        segment = block[inv.end():stop]
+        pairs = []
+        params = list(_PARAM_RE.finditer(segment))
+        for j, prm in enumerate(params):
+            pend = params[j + 1].start() if j + 1 < len(params) else len(segment)
+            raw = _strip_cdata(segment[prm.end():pend]).strip("\r\n")
+            is_str = prm.group(2).lower() == "true"
+            if not is_str:
+                raw = _trim_to_json_prefix(raw)
+            pairs.append(_dsml_arg_to_json(prm.group(1), raw, is_str))
+        arguments = "{" + ", ".join(pairs) + "}" if pairs else "{}"
+        calls.append({"name": name, "arguments": arguments})
     return calls
 
 
-class ToolStreamBuffer:
-    """Streams visible text, captures <tc>...</tc> blocks (native GLM
-    <tool_call>...</tool_call> too) and converts them to OpenAI tool_calls.
-    If a captured block turns out not to be a valid tool call
-    (e.g. '<tc>' mentioned in prose/code), its text is released back
-    to the output so nothing is lost."""
+def parse_tool_call_blocks(text):
+    """Parse every <DSML calls> block in the text into OpenAI tool_calls.
+    Parallel calls are several <DSML invoke> entries inside one block."""
+    calls = []
+    for m in re.finditer(re.escape(DSML_CALLS_OPEN), text):
+        nxt = text.find(DSML_CALLS_OPEN, m.end())
+        calls.extend(_parse_dsml_block(text[m.end():nxt if nxt != -1 else len(text)]))
+    return calls
 
-    OPEN_TAGS = ("<tc>", "<tool_call>")
-    CLOSE_TAGS = ("</tc>", "</tool_call>")
+
+def tool_call_dsml(name, arguments):
+    """History re-injection: an OpenAI tool_call rendered back as DSML."""
+    lines = [f'<{DSML_TOKEN} invoke name="{name}">']
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            arguments = {"arguments": arguments}
+    for k, v in (arguments or {}).items():
+        is_str = isinstance(v, str)
+        value = v if is_str else json.dumps(v, ensure_ascii=False)
+        lines.append(f'<{DSML_TOKEN} parameter name="{k}" string="{"true" if is_str else "false"}">{value}')
+    return DSML_CALLS_OPEN + "\n" + "\n".join(lines)
+
+
+class ToolStreamBuffer:
+    """Streams visible text and captures <DSML calls> blocks, converting them to
+    OpenAI tool_calls. DSML tags are never closed, so a block counts as finished
+    when the next one starts or at flush() (end of stream). A block that does not
+    parse as a tool call is released back as plain text, so nothing is lost when
+    the model merely mentions the markup in prose."""
 
     def __init__(self):
         self.buf = ""
@@ -766,11 +740,8 @@ class ToolStreamBuffer:
 
         while True:
             if not self.capturing:
-                # locate the nearest opening tag of either kind
-                starts = [self.buf.find(t) for t in self.OPEN_TAGS if self.buf.find(t) != -1]
-                idx = min(starts) if starts else -1
+                idx = self.buf.find(DSML_CALLS_OPEN)
                 if idx == -1:
-                    # emit everything except a potentially partial trailing tag
                     hold = self._partial_hold_len()
                     if hold:
                         visible_out += self.buf[: len(self.buf) - hold]
@@ -783,41 +754,45 @@ class ToolStreamBuffer:
                 self.buf = self.buf[idx:]
                 self.capturing = True
 
-            ends = [self.buf.find(t) for t in self.CLOSE_TAGS if self.buf.find(t) != -1]
-            if not ends:
-                break  # wait for more data inside the block
-            end = min(ends)
-            # use the length of whichever closing tag actually matched
-            matched_close = [t for t in self.CLOSE_TAGS if self.buf.find(t) == end]
-            close_len = len(matched_close[0]) if matched_close else len(self.CLOSE_TAGS[0])
-            block_end = end + close_len
-            block = self.buf[:block_end]
-            self.buf = self.buf[block_end:]
-            self.capturing = False
+            close = self.buf.find(DSML_CALLS_CLOSE)
+            reopen = self.buf.find(DSML_CALLS_OPEN, len(DSML_CALLS_OPEN))
+            if close != -1 and (reopen == -1 or close < reopen):
+                block = self.buf[:close]
+                self.buf = self.buf[close + len(DSML_CALLS_CLOSE):]
+                self.capturing = False
+            elif reopen != -1:
+                block = self.buf[:reopen]
+                self.buf = self.buf[reopen:]
+            else:
+                break                      # unterminated, wait for more data
 
             calls = parse_tool_call_blocks(block)
             if calls:
-                completed = calls  # real tool call -> consumed, not visible
+                completed = (completed or []) + calls   # real call -> not visible
             else:
-                visible_out += block  # false positive -> release as plain text
+                visible_out += block                     # false positive -> text
 
         return visible_out, completed
 
     def _partial_hold_len(self):
-        """If buffer ends with a prefix of any opening/closing tag, hold it back."""
-        for marker in self.OPEN_TAGS + self.CLOSE_TAGS:
-            max_check = min(len(marker) - 1, len(self.buf))
-            for l in range(max_check, 0, -1):
-                if marker.startswith(self.buf[-l:]):
-                    return l
+        """If the buffer ends with a prefix of the opening tag, hold it back."""
+        for l in range(min(len(DSML_CALLS_OPEN) - 1, len(self.buf)), 0, -1):
+            if DSML_CALLS_OPEN.startswith(self.buf[-l:]):
+                return l
         return 0
 
     def flush(self):
-        """Final drain at stream end: release everything still buffered."""
-        leftover = self.buf
-        self.buf = ""
+        """Final drain: returns (leftover_visible_text, calls_or_None)."""
+        leftover, self.buf = self.buf, ""
         self.capturing = False
-        return leftover
+        if not leftover:
+            return "", None
+        calls = parse_tool_call_blocks(leftover)
+        if not calls:
+            return leftover, None
+        head = leftover[: leftover.find(DSML_CALLS_OPEN)].lstrip("\r\n")
+        return head, calls
+
 
 # DeepSeek has no "Deep Think" dropdown: the think/search toggles live in
 # what the site itself put in the request body, i.e. its own toggle state.
@@ -836,23 +811,20 @@ async def poll_js(page, expr, arg=None, timeout_s=10, poll_ms=100):
     return None
 
 
+def save_accounts(accounts, rotate_every=None):
+    try:
+        data = {"rotate_every": int(rotate_every if rotate_every is not None else 10), "accounts": accounts}
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        log(f"[accounts] saved {len(accounts)} account(s) to {ACCOUNTS_FILE}")
+        return True
+    except Exception as e:
+        log(f"[accounts] failed to save: {e}", level="ERROR")
+        return False
+
+
 def load_accounts():
-    """accounts.json format (shared with the z.ai fork, one file per project):
-
-    {
-      "rotate_every": 25,
-      "accounts": [{
-        "name": "main",
-        "token":  "<opaque userToken from localStorage - NOT a JWT>",
-        "user_id": "<__appKit_userInfo.id>",
-        "web_id":  "<__tea_cache_tokens_*.web_id>",
-        "device_id": "<deepseek-device-id:chat>"
-      }]
-    }
-
-    user_id / web_id / device_id are optional: when absent the app fills them
-    in itself after the token authenticates.
-    """
+    """accounts.json format"""
     try:
         with open(ACCOUNTS_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -860,15 +832,12 @@ def load_accounts():
         rotate_every = data.get("rotate_every", 10) if isinstance(data, dict) else 10
     except FileNotFoundError:
         log(f"{ACCOUNTS_FILE} not found, using fallback token", level="WARN")
-        accounts = [{"name": "default", "token": TOKEN}]
+        accounts = [{"name": "default", "token": TOKEN, "email": "", "password": ""}]
         rotate_every = 10
-    valid = [a for a in accounts if a.get("token")]
-    if not valid:
-        raise RuntimeError(
-            f"no usable account in {ACCOUNTS_FILE} - add one with a 'token' field")
-    log(f"Loaded {len(valid)} account(s): "
-        f"{[a.get('name') or a.get('email') or '?' for a in valid]}")
-    return valid, int(rotate_every)
+    # allow accounts even without token - we'll refresh them
+    log(f"Loaded {len(accounts)} account(s): "
+        f"{[a.get('name') or a.get('email') or '?' for a in accounts]}")
+    return accounts, int(rotate_every)
 
 
 import psutil  # noqa: E402
@@ -1010,8 +979,8 @@ def map_thinking(reasoning_effort, enable_search=None, model=None):
 
 # History rendering is kept 1:1 with the z.ai original (build_prompt): OpenAI
 # messages become JSONL lines under a "# History" header, tool calls are folded
-# into the assistant content as native <tc> XML, tool results are keyed by
-# display label and wrapped in <tool_response>, and the first system message is
+# into the assistant content as a DSML block, tool results are keyed by
+# display label and wrapped in <tool_result>, and the first system message is
 # lifted into a role=system line right after the header. The prompt is pasted
 # verbatim into DeepSeek's composer, which is single-turn, so the whole
 # conversation has to travel as text.
@@ -1077,11 +1046,11 @@ def build_prompt(messages, tools=None):
                     args = raw_args or {}
                 calls.append({"name": fn.get("name", "unknown"), "arguments": args})
             # Tool calls are folded into the SAME content field as native
-            # <tc> XML blocks at the end (the shape the model
+            # DSML blocks at the end (the shape the model
             # itself must emit), instead of a separate tool_calls key.
             if calls:
                 tc_text = "\n".join(
-                    tool_call_xml(c["name"], c.get("arguments") or {}) for c in calls
+                    tool_call_dsml(c["name"], c.get("arguments") or {}) for c in calls
                 )
                 if content:
                     content += "\n"
@@ -1093,7 +1062,7 @@ def build_prompt(messages, tools=None):
         elif role == "tool":
             label = call_label_by_id.get(m.get("tool_call_id"), "unknown")
             hist_lines.append({"role": "tool", "name": label,
-                               "content": f"<tool_response>{content}</tool_response>"})
+                               "content": f"<tool_result>{content}</tool_result>"})
 
     # The first system message (if any) becomes the "[System instructions]"
     # block and is placed right after the History header below.
@@ -1136,7 +1105,7 @@ def build_prompt(messages, tools=None):
         f"{convo}\n\n"
         f"---\n"
         f"{SYSTEM_CONTINUE}\n"
-        f"Assistant's reply (ONLY content):"
+        f"Write ONLY the Assistant's response. (Content block)"
     ), last_user
 
 
@@ -1589,6 +1558,8 @@ class DeepSeekSession:
         self.page.on("pageerror", self._on_pageerror)
         await self._apply_account(self.current_account)
         await self._open_chat()
+        # _open_chat raises unless the page is genuinely signed in, so
+        # reaching this line really does mean we have a session
         log(f"[browser] worker #{self.worker_id} up, account "
             f"'{self._label(self.account_idx)}' authenticated")
 
@@ -1613,13 +1584,118 @@ class DeepSeekSession:
             "path": "/",
         }])
 
+    async def _is_authenticated(self):
+        """Composer on screen AND a token the server still accepts.
+
+        Presence is not enough: ACCOUNT_SHIM_JS re-injects the account token
+        into localStorage on every navigation, so a dead one is always
+        non-null and the page still renders a textarea on the sign-in wall.
+        The only trustworthy signal is chat_session/create answering code 0.
+        """
+        try:
+            token = await self.page.evaluate(SESSION_TOKEN_JS)
+            if not token:
+                return False
+            if not await self.page.evaluate(AUTHED_CHAT_JS):
+                return False
+            probe = await self.page.evaluate(TOKEN_PROBE_JS, token)
+            return bool(probe and probe.get("ok"))
+        except Exception:
+            return False
+
+    async def _browser_login(self, acc):
+        """Sign in through the real form and return the fresh userToken.
+
+        DeepSeek rotates tokens with no refresh endpoint, so the only way back
+        in is a full credential login. Returns "" on any failure.
+        """
+        email = (acc.get("email") or "").strip()
+        password = acc.get("password") or ""
+        if not (email and password):
+            log("[auth] account has no email/password - cannot log in", level="ERROR")
+            return ""
+        log(f"[auth] signing in as {email}")
+        try:
+            await self.page.goto(SIGN_IN_URL, wait_until="domcontentloaded", timeout=90000)
+            if not await poll_js(self.page, LOGIN_FORM_READY_JS, timeout_s=30):
+                log("[auth] sign-in form never rendered", level="ERROR")
+                return ""
+            await self.page.fill(EMAIL_INPUT_SEL, email)
+            await self.page.fill(PASSWORD_INPUT_SEL, password)
+            await asyncio.sleep(0.5)
+            btn = self.page.locator(LOGIN_BUTTON_SEL)
+            if await btn.count() and await btn.first.is_visible():
+                await btn.first.click()
+            else:
+                await self.page.press(PASSWORD_INPUT_SEL, 'Enter')
+            for _ in range(20):
+                await asyncio.sleep(1.5)
+                if "/sign_in" not in (self.page.url or ""):
+                    break
+            token = await self.page.evaluate(SESSION_TOKEN_JS)
+        except Exception as e:
+            log(f"[auth] login failed: {e}", level="ERROR")
+            return ""
+        if not token:
+            log("[auth] login returned no token", level="ERROR")
+        return token or ""
+
+    async def _ensure_signed_in(self):
+        """Make sure this worker is on a genuinely authenticated chat.
+
+        Returns False (rather than raising) so the caller decides how to fail.
+        """
+        if await self._is_authenticated():
+            return True
+        acc = self.current_account
+        if not AUTO_REFRESH:
+            log("[auth] not signed in and 'Auto Refresh Tokens' is OFF", level="ERROR")
+            return False
+        log("[auth] not signed in (stale token?) - logging in", level="WARN")
+        async with _auth_lock():
+            # another worker may have rotated the shared token while we waited
+            await self._apply_account(acc)
+            if await self._is_authenticated():
+                log("[auth] token was already refreshed by another worker")
+                return True
+            token = await self._browser_login(acc)
+        if not token:
+            return False
+        if token != acc.get("token"):
+            acc["token"] = token
+            save_accounts(self.accounts, self.rotate_every)
+            log("[auth] token refreshed and saved to accounts.json")
+        # the account shim reads the token from a cookie, so re-stage it before
+        # the next navigation
+        await self._apply_account(acc)
+        # the app needs a beat to mount the composer on a brand-new session
+        if not await poll_js(self.page, AUTHED_CHAT_JS, timeout_s=CHAT_URL_READY_TIMEOUT):
+            log(f"[auth] {await self._no_composer_reason()}", level="ERROR")
+            return False
+        return await self._is_authenticated()
+
     async def _open_chat(self):
         """Load a brand-new chat. DeepSeek pre-creates a chat session on every
         page load, so navigating to '/' gives each API call a clean context."""
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
+        await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT)
+        if not await self._ensure_signed_in():
+            raise RuntimeError("chat.deepseek.com is not signed in and login failed")
         if not await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT):
-            raise RuntimeError("chat.deepseek.com never rendered the composer")
+            raise RuntimeError(await self._no_composer_reason())
         return True
+
+    async def _no_composer_reason(self):
+        """Explain a missing composer. A suspended account renders a notice
+        instead of the chat UI, and no amount of logging in will fix that."""
+        try:
+            suspended = await self.page.evaluate(SUSPENDED_JS)
+        except Exception:
+            suspended = ''
+        if suspended:
+            log(f"[auth] account is blocked by DeepSeek: {suspended}", level="ERROR")
+            return f"account unavailable: {suspended}"
+        return "chat.deepseek.com never rendered the composer"
 
     # ---------------- rotation / retry ----------------
     async def switch_account(self, idx):
@@ -1643,6 +1719,9 @@ class DeepSeekSession:
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
         if "chat.deepseek.com" not in (self.page.url or ""):
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
+        await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT)
+        if not await self._ensure_signed_in():
+            raise RuntimeError("page is not signed in and login failed after reload")
         if not await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT):
             raise RuntimeError("page never became ready after reload")
 
@@ -2292,7 +2371,21 @@ async def chat_completions(request: Request):
 
             try:
                 if tool_buf is not None:
-                    leftover = tool_buf.flush()
+                    leftover, tail_calls = tool_buf.flush()
+                    if tail_calls:
+                        if finish_reason != "tool_calls":
+                            tool_call_index = 0
+                        finish_reason = "tool_calls"
+                        for tc in tail_calls:
+                            yield sse(make_chunk(chunk_id, created, req_model, {
+                                "tool_calls": [{
+                                    "index": tool_call_index,
+                                    "id": "call_" + secrets.token_hex(8),
+                                    "type": "function",
+                                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                                }]
+                            }))
+                            tool_call_index += 1
                     if leftover:
                         full_answer.append(leftover)
                         yield sse(make_chunk(chunk_id, created, req_model, {"content": leftover}))
@@ -2337,7 +2430,7 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
         retries = 0
         while True:
             reasoning_parts, answer_parts = [], []
-            raw_answer = ""
+            all_calls = []
             tool_buf = ToolStreamBuffer() if has_tools else None
             fail_reason = None
 
@@ -2360,14 +2453,16 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
                         reasoning_parts.append(delta)
                     elif phase != "error":
                         if tool_buf is not None:
-                            raw_answer += delta
-                            visible, _ = tool_buf.feed(delta)
+                            visible, calls_batch = tool_buf.feed(delta)
+                            if calls_batch:
+                                all_calls.extend(calls_batch)
                             answer_parts.append(visible)
                         else:
                             answer_parts.append(delta)
-                            raw_answer += delta
                 if tool_buf is not None:
-                    leftover = tool_buf.flush()
+                    leftover, tail_calls = tool_buf.flush()
+                    if tail_calls:
+                        all_calls.extend(tail_calls)
                     if leftover:
                         answer_parts.append(leftover)
 
@@ -2411,16 +2506,14 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
     log(f"--> done: reasoning={sum(len(x) for x in reasoning_parts)}ch "
         f"answer={sum(len(x) for x in answer_parts)}ch "
         f"prompt_len={prompt_len} | model={req_model}", level="OK")
-    if has_tools:
-        calls = parse_tool_call_blocks(raw_answer)
-        if calls:
-            message["tool_calls"] = [{
-                "id": "call_" + secrets.token_hex(8),
-                "type": "function",
-                "function": {"name": tc["name"], "arguments": tc["arguments"]},
-            } for tc in calls]
-            message["content"] = None
-            finish = "tool_calls"
+    if has_tools and all_calls:
+        message["tool_calls"] = [{
+            "id": "call_" + secrets.token_hex(8),
+            "type": "function",
+            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+        } for tc in all_calls]
+        message["content"] = None
+        finish = "tool_calls"
     return {
         "id": chunk_id,
         "object": "chat.completion",
@@ -2448,12 +2541,14 @@ async def main():
 
 # ===== STARTUP MENU =====
 
-LOGO = r"""██████╗ ███████╗███████╗██████╗ ███████╗███████╗███████╗██╗  ██╗
-██╔══██╗██╔════╝██╔════╝██╔══██╗██╔════╝██╔════╝██╔════╝██║  ██║
-██████╔╝█████╗  █████╗  ██████╔╝█████╗  █████╗  █████╗  ███████║
-██╔══██║██╔══╝  ██╔══╝  ██╔══██╗██╔══╝  ██╔══╝  ██╔══╝  ██╔══██║
-██║  ██║███████╗███████╗██║  ██║███████╗███████╗███████╗██║  ██║
-╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝"""
+LOGO = r"""███████╗██████╗ ███████╗███████╗    ██████╗ ███████╗███████╗██████╗ ███████╗███████╗███████╗██╗  ██╗      █████╗ ██████╗ ██╗
+██╔════╝██╔══██╗██╔════╝██╔════╝    ██╔══██╗██╔════╝██╔════╝██╔══██╗██╔════╝██╔════╝██╔════╝██║ ██╔╝     ██╔══██╗██╔══██╗██║
+█████╗  ██████╔╝█████╗  █████╗█████╗██║  ██║█████╗  █████╗  ██████╔╝███████╗█████╗  █████╗  █████╔╝█████╗███████║██████╔╝██║
+██╔══╝  ██╔══██╗██╔══╝  ██╔══╝╚════╝██║  ██║██╔══╝  ██╔══╝  ██╔═══╝ ╚════██║██╔══╝  ██╔══╝  ██╔═██╗╚════╝██╔══██║██╔═══╝ ██║
+██║     ██║  ██║███████╗███████╗    ██████╔╝███████╗███████╗██║     ███████║███████╗███████╗██║  ██╗     ██║  ██║██║     ██║
+╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝    ╚═════╝ ╚══════╝╚══════╝╚═╝     ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝     ╚═╝  ╚═╝╚═╝     ╚═╝"""
+
+
 
 
 RESET = "\x1b[0m"
@@ -2495,6 +2590,51 @@ def _term_width():
         return 80
 
 
+def _logo_width():
+    return max(_visible_len(l) for l in LOGO.splitlines())
+
+
+# Remember what we already asked for, so a terminal that ignores the request
+# does not get the sequence re-sent on every redraw.
+_LAST_AUTO_WIDTH = 0
+
+
+def _ensure_terminal_width(min_w=None):
+    """Grow the terminal to fit the banner, via XTWINOPS.
+
+    CSI 8 ; rows ; cols t resizes the text area in character cells. It is
+    honoured by xterm and every emulator that follows it (kitty, alacritty,
+    wezterm, gnome-terminal, konsole, foot, iTerm2). One that does not simply
+    ignores the bytes, so this is safe to send without probing first.
+    """
+    global _LAST_AUTO_WIDTH
+    if min_w is None:
+        min_w = _logo_width()
+    cur = _term_width()
+    if cur <= 0 or cur >= min_w:
+        _LAST_AUTO_WIDTH = 0
+        return cur
+    if _LAST_AUTO_WIDTH == min_w:
+        return cur
+    _LAST_AUTO_WIDTH = min_w
+    try:
+        import shutil
+        rows = max(shutil.get_terminal_size().lines, 25)
+        sys.stdout.write("[8;%d;%dt" % (rows, min_w))
+        sys.stdout.flush()
+    except Exception:
+        return cur
+    time.sleep(0.2)  # let the emulator apply it before we measure again
+    grown = _term_width()
+    if grown < min_w:
+        # Keep _LAST_AUTO_WIDTH set so we do not spam a terminal that will
+        # never grow. It resets to 0 as soon as the width is enough, so a
+        # manual resize re-arms the check.
+        log(f"[menu] terminal is {grown} cols, banner needs {min_w} "
+            f"- it ignored the resize request, banner will wrap", level="WARN")
+    return grown
+
+
 def _center(s, width=None):
     """Center a plain (non-ANSI) string on a terminal line."""
     if width is None:
@@ -2530,13 +2670,13 @@ def _gradient_lines(lines, width):
 def _render_menu():
     _enable_ansi()
     _clear()
-    w = _term_width()
+    w = _ensure_terminal_width()
     for line in _gradient_lines(LOGO.splitlines(), w):
         print(line)
     print()
     table = [
         ["[1] Start", f"[4] API Port: {PORT}", "[7] GitHub"],
-        ["[5] Open accounts.json", "[8] Exit", ""],
+        [f"[2] {_tick(AUTO_REFRESH)} Auto Refresh Tokens", "[5] Open accounts.json", "[8] Exit"],
         [f"[3] {_tick(ACCOUNT_ROTATE)} Account Rotate", f"[6] {_tick(HEADLESS)} Hide Window", ""],
     ]
     # is then separated by exactly COL_GAP spaces, so all rows align perfectly.
@@ -2590,7 +2730,7 @@ def open_github():
 
 async def run_menu():
     """Interactive startup menu. Returns when the user picks [1] Start."""
-    global PORT, HEADLESS, ACCOUNT_ROTATE
+    global PORT, HEADLESS, ACCOUNT_ROTATE, AUTO_REFRESH
     while True:
         _render_menu()
         try:
@@ -2603,6 +2743,8 @@ async def run_menu():
         if choice == "1":
             _clear()
             return
+        elif choice == "2":
+            AUTO_REFRESH = not AUTO_REFRESH
         elif choice == "3":
             ACCOUNT_ROTATE = not ACCOUNT_ROTATE
         elif choice == "4":
