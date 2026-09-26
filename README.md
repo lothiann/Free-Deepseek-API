@@ -69,13 +69,11 @@ server and is accepted, but produces byte-identical behaviour to `default` (0 vs
 characters with DeepThink off, 77 vs 76 with it on), so there is nothing to expose. Vision adds
 nothing either: the same image was read correctly through all three ids.
 
-Reasoning is a **toggle, not a model**. It maps from `reasoning_effort`:
-
-| `reasoning_effort` | DeepThink |
-|---|---|
-| `none` / `off` / `disabled` / `minimal` / `low` | off |
-| `medium` / `high` / `max` | on |
-| omitted | on for `deepseek-reasoner`, off for `deepseek-chat` |
+Reasoning is a **toggle, not a model**, and its state follows the model you asked for:
+`deepseek-reasoner` turns DeepThink on, `deepseek-chat` leaves it off. The site exposes no
+reasoning-effort control, so the proxy does not accept a `reasoning_effort` parameter — sending one
+has no effect. Web search is the composer's other switch, and it is always off; a request cannot
+turn it on.
 
 ## Tool calls
 
@@ -103,9 +101,10 @@ Two details are easy to get wrong, and the official prompt spells both out:
 | `<｜DSML｜ parameter name="K" string="true">` | value is a **raw string**, passed through untouched |
 | `<｜DSML｜ parameter name="K" string="false">` | value is **JSON** (number, bool, array, object) |
 
-In practice the model often leaves the block unclosed, so the parser does not depend on the closing
-tags: a call is considered finished at the next `invoke` or at end of stream, and a closing
-`</｜DSML｜ calls>` is honoured when it does appear.
+Closing tags are the norm, not an exception: the official format closes every tag, ending a value at
+`</｜DSML｜ parameter>`, a call at `</｜DSML｜ invoke>` and the block at `</｜DSML｜ calls>`. A model
+that omits one should still not break the call, so the parser also accepts a value running to the
+next `parameter` or `invoke`, and a block closed by the next `<｜DSML｜ calls>` or by end of stream.
 
 `string="true"` versus `string="false"` is the only distinction that matters: a non-string argument
 has to arrive as valid JSON, so any surrounding prose is trimmed to the first complete JSON value
@@ -288,7 +287,8 @@ only to satisfy the client.
   `input_character_limit: 2621440`, so the declared `context` is left at a conservative 131072.
 - The two switches are the real `div.ds-toggle-button` controls in the composer — **DeepThink** and
   **Search** — clicked only when the current `aria-pressed` state differs from the requested one, so
-  the site's own persistence is respected.
+  the site's own persistence is respected. DeepThink is requested from the model id, and Search is
+  always requested off, so the proxy never enables web search.
 - Stale remote feature caches are dropped on every page load (`__ds_remote_feature_store*`), which
   is what lets a newly enabled `expert` entry take effect without a code change.
 - Logs are written to `logs/`, the last raw response to `last_response.json`.
