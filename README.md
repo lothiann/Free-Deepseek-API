@@ -1,5 +1,8 @@
 # Free-Deepseek-API
 
+![Preview in terminal](image.png)
+
+
 Self-hosted OpenAI-compatible API proxy for [chat.deepseek.com](https://chat.deepseek.com).
 Runs a real browser session via **CloakBrowser** (stealth Chromium), so the site sees a genuine
 browser fingerprint and the WAF / PoW checks pass on their own — no third-party captcha services,
