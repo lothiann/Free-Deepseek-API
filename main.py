@@ -19,13 +19,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
-try:
-    # DeepSeek's own tokenizer, so usage counts match what the site bills.
-    # Optional: without it we fall back to the ~4 chars/token estimate.
-    from deepseek_tokenizer import ds_token
-except Exception:  # pragma: no cover - depends on the install
-    ds_token = None
-
 # ===== CONFIG =====
 TOKEN = ""
 HOST = "127.0.0.1"
@@ -1741,6 +1734,34 @@ FILL_JS = """
     }
 """
 
+# Over the site's character limit the composer shows "Over limit by N%" and
+# submission is dropped. The Send control is a div.ds-button--primary
+# ds-button--filled (not a <button>, and NOT disabled by the limit - the block
+# is an intercept in the submit path), so it is clicked directly and Enter is
+# only the fallback.
+FORCE_SEND_JS = """
+    () => {
+        const vis = (el) => !!(el.offsetWidth || el.offsetHeight);
+        const pick = (sel) => {
+            for (const el of document.querySelectorAll(sel)) {
+                const id = (el.id || '') + ' ' +
+                           (el.className && el.className.baseVal !== undefined
+                               ? el.className.baseVal : el.className || '') + '';
+                if (!vis(el) || /stop/i.test(id)) continue;
+                if (el.disabled) el.removeAttribute('disabled');
+                return el;
+            }
+            return null;
+        };
+        const btn = pick('div.ds-button--primary.ds-button--filled')
+                 || pick('#send-message-button')
+                 || pick('button[class*="send" i], [id*="send" i]');
+        if (!btn) return false;
+        btn.click();
+        return true;
+    }
+"""
+
 
 class DeepSeekSession:
     """One CloakBrowser context pinned to one DeepSeek account.
@@ -2105,7 +2126,10 @@ class DeepSeekSession:
         if not await self.page.evaluate(FILL_JS, prompt):
             raise RuntimeError("composer disappeared before the prompt was typed")
         await asyncio.sleep(0.1)
-        await ta.press("Enter")
+        # Over the site's character limit Send is disabled, so Enter does
+        # nothing; force the button and click it.
+        if not await self.page.evaluate(FORCE_SEND_JS):
+            await ta.press("Enter")
 
     async def stop_if_client_gone(self):
         """Click the site's stop button if the client hung up.
@@ -2426,73 +2450,68 @@ def make_chunk(chunk_id, created, model, delta, finish_reason=None):
     }
 
 
-CHARS_PER_TOKEN = 4   # only used when deepseek-tokenizer is not installed
+def _chars(text):
+    """Length in characters.
+
+    Deliberately NOT tokens. The site itself measures the composer in
+    characters - it warns "Over limit by N%" past input_character_limit
+    (2621440) - so a character count is the number the user can act on, and
+    the site's tokenizer is neither exposed nor stable across model versions.
+    The OpenAI-shaped fields keep their names because clients expect them;
+    they simply carry characters now."""
+    return len(text or "")
 
 
-def _tok(text):
-    """Token count for a string. Uses DeepSeek's own tokenizer when it is
-    installed - it is a pure-Python BPE but still does ~1 MB/s, so a 40k-char
-    prompt costs ~30ms. Falls back to the usual ~4 chars/token estimate."""
-    if not text:
-        return 0
-    if ds_token is not None:
-        try:
-            return len(ds_token.encode(text, add_special_tokens=False))
-        except Exception as e:
-            log(f"[usage] tokenizer failed ({e}) - falling back to chars/"
-                f"{CHARS_PER_TOKEN}", level="WARN")
-    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
-
-
-def _msg_tokens(m):
+def _msg_chars(m):
     try:
-        return _tok(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
+        return _chars(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
     except Exception:
-        return _tok(str(m))
+        return _chars(str(m))
 
 
-def _non_text_part_tokens(m):
-    """Tokens contributed by image / audio content parts inside a message."""
-    image_tokens = audio_tokens = 0
+def _non_text_part_chars(m):
+    """Characters contributed by image / audio content parts inside a message."""
+    image_chars = audio_chars = 0
     content = m.get("content")
     if isinstance(content, list):
         for part in content:
             if not isinstance(part, dict):
                 continue
             t = part.get("type")
-            if t == "image_url":
-                image_tokens += _msg_tokens(part.get("image_url") or {})
+            if t in ("image_url", "input_image", "input_video", "video_url"):
+                image_chars += _msg_chars(part)
             elif t == "input_audio":
-                audio_tokens += _msg_tokens(part.get("input_audio") or {})
-    return image_tokens, audio_tokens
+                audio_chars += _msg_chars(part)
+    return image_chars, audio_chars
 
 
 def build_usage(messages, full_reasoning, full_answer):
-    """Token counts at ~4 chars/token. The whole history is on our side (it is
-    echoed back in the request), so one uniform rule covers it - there is
-    nothing to reconcile with an upstream counter. Output follows the standard
-    OpenAI usage shape (prompt_tokens_details / completion_tokens_details):
+    """Character counts. The whole history is on our side (it is echoed back in
+    the request), so one uniform rule covers it - there is nothing to reconcile
+    with an upstream counter. Output follows the standard OpenAI usage shape
+    (prompt_tokens_details / completion_tokens_details), with the values
+    expressed in characters:
     - prompt_tokens   = every non-assistant message (user/system/developer/
-        tool/function ...) serialized as JSON, incl. image/audio parts;
+        tool/function ...) serialized as JSON, incl. image/video/audio parts;
     - completion_tokens = every assistant message serialized as JSON (incl.
         tool_calls) + the newly generated reasoning/answer.
     """
     prompt_text = prompt_image = prompt_audio = completion_hist = 0
     for m in messages or []:
-        n = _msg_tokens(m)
+        n = _msg_chars(m)
         if (m.get("role") or "unknown") == "assistant":
             completion_hist += n
         else:
             prompt_text += n
-        img, aud = _non_text_part_tokens(m)
+        img, aud = _non_text_part_chars(m)
         prompt_image += img
         prompt_audio += aud
     prompt_image = min(prompt_image, prompt_text)
     prompt_audio = min(prompt_audio, prompt_text - prompt_image)
 
-    reasoning_tok = _tok("".join(full_reasoning or []))
-    answer_tok = _tok("".join(full_answer or []))
-    completion_len = completion_hist + reasoning_tok + answer_tok
+    reasoning_chars = _chars("".join(full_reasoning or []))
+    answer_chars = _chars("".join(full_answer or []))
+    completion_len = completion_hist + reasoning_chars + answer_chars
 
     return {
         "prompt_tokens": prompt_text,
@@ -2508,7 +2527,7 @@ def build_usage(messages, full_reasoning, full_answer):
         },
         "completion_tokens": completion_len,
         "completion_tokens_details": {
-            "reasoning_tokens": reasoning_tok,
+            "reasoning_tokens": reasoning_chars,
             "accepted_prediction_tokens": 0,
             "rejected_prediction_tokens": 0,
             "audio_tokens": 0,

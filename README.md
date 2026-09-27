@@ -260,8 +260,8 @@ Add to `~/.config/opencode/opencode.jsonc` (or `opencode.json`):
         "apiKey": "sk-nothing"
       },
       "models": {
-        "deepseek-chat":     { "name": "DeepSeek Chat",     "limit": { "context": 1048576, "output": 1048576 } },
-        "deepseek-reasoner": { "name": "DeepSeek Reasoner", "limit": { "context": 1048576, "output": 1048576 } }
+        "deepseek-chat":     { "name": "DeepSeek Chat",     "limit": { "context": 2621440, "output": 2621440 } },
+        "deepseek-reasoner": { "name": "DeepSeek Reasoner", "limit": { "context": 2621440, "output": 2621440 } }
       }
     }
   }
@@ -286,11 +286,13 @@ only to satisfy the client.
 - Reasoning is streamed via `delta.reasoning_content`, the answer via `delta.content`.
 - Tool calls require the client to send standard OpenAI `tools`; results come back as
   `role: "tool"` messages. See [Tool calls](#tool-calls).
-- `usage` counts real **tokens** via DeepSeek's own tokenizer (`deepseek-tokenizer`, vocab 129283),
-  so the numbers match what the site bills rather than a chars/4 guess. Without that package
-  installed it degrades to ~4 chars/token. The `context` / `output` above are 1048576 (2^20), the
-  tokenizer's own `model_max_length` for DeepSeek-V4.1-Flash, matching the model card's
-  `context_window` of one million tokens.
+- `usage` counts **characters**, not tokens. The site measures its own composer the same way: it
+  rejects a longer prompt with `Over limit by N%`, measured against `input_character_limit` =
+  **2621440**, which is the number that matters and the one users can act on. The tokenizer is
+  neither exposed by the site nor stable across model versions, so a token count would be a guess
+  that drifts. The OpenAI-shaped field names (`prompt_tokens` and friends) are kept because clients
+  expect them; they now carry characters. The `context` / `output` above are 2621440, the site's own
+  `input_character_limit`, identical for all three model types.
 - The two switches are the real `div.ds-toggle-button` controls in the composer — **DeepThink** and
   **Search** — clicked only when the current `aria-pressed` state differs from the requested one, so
   the site's own persistence is respected. DeepThink is requested from the model id, and Search is
