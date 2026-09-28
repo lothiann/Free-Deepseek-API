@@ -10,9 +10,16 @@ import urllib.request
 import uuid
 import sys
 import os
+import shutil
+import threading
 import webbrowser
 from urllib.parse import quote
 from datetime import datetime
+
+try:
+    from deepseek_tokenizer import ds_token
+except ImportError:      # optional: stats fall back to character counts only
+    ds_token = None
 
 from cloakbrowser import launch_context_async
 from fastapi import FastAPI, Request
@@ -43,6 +50,7 @@ REQUEST_COOLDOWN = 0               # seconds between requests
 TOOL_CALL_DELAY = 0.5              # seconds between parallel tool-call chunks, avoids Busy errors in the client
 MAX_REQUEST_RETRIES = 4            # max retries per request before giving up
 ACCOUNTS_FILE = "accounts.json"
+RESIZE_WAIT = 2.0                   # seconds to wait for the terminal to honour a resize request
 
 # ===== STREAM TIMING =====
 STREAM_POLL_MS = 80                # how often we pull the XHR buffer out of the page
@@ -53,6 +61,11 @@ STREAM_IDLE_TIMEOUT = 300          # seconds without any new bytes before we cal
 RETRY_AFTER_STALL = 8
 CHAT_URL_READY_TIMEOUT = 45        # seconds to wait for the composer textarea
 IMAGE_UPLOAD_WAIT = 4.0            # seconds to let the site finish uploading attachments
+
+# Persistent token/character counters, shown on the startup screen. Kept next
+# to the script (not in CWD) so the numbers follow it wherever it is run from.
+STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
+
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -359,6 +372,27 @@ INPUT_READY_JS = """
     }
 """
 
+# Composer-ready check that also notices a ban while it waits. A suspended
+# account never renders a textarea, so waiting for one burns the whole timeout
+# before anyone looks at the alert; this reports 'ban' the moment it appears.
+COMPOSER_OR_BAN_JS = """
+    () => {
+        // The ban notice is checked FIRST: the sidebar keeps a visible
+        // textarea[name="search"] on the suspension page, so testing for a
+        // composer before the alert reports "ready" and every later step then
+        // times out on the wrong textarea instead of failing fast.
+        const BLOCK = /suspend|violation of user polic|deactivat|account (?:has been )?(?:banned|blocked)|\\u8d26\\u6237.{0,6}(?:\\u5c01|\\u7981|\\u505c\\u7528)/i;
+        for (const el of document.querySelectorAll(
+                'div[class*="ds-alert"], div.ds-alert__content, [role="alert"]')) {
+            const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            if (txt && BLOCK.test(txt)) return 'ban';
+        }
+        const tas = [...document.querySelectorAll('textarea')].filter(t => t.offsetParent);
+        if (tas.length) return 'ready';
+        return '';
+    }
+"""
+
 # Read the mirrored XHR buffer. Cheap enough to poll every ~80ms.
 TAP_POLL_JS = """
     () => {
@@ -498,8 +532,22 @@ AUTHED_CHAT_JS = """
 # "never rendered the composer" into the actual reason.
 SUSPENDED_JS = """
     () => {
+        // A suspended account renders a ds-alert instead of the chat UI:
+        //   <div class="ds-alert ds-alert--warning ds-alert--bordered">
+        //     <div class="ds-alert__content">Due to violation of user policies,
+        //     your account has been suspended until <date>. ...</div>
+        // The class names are hashed, so the alert is found by its own
+        // ds-alert / ds-alert__content classes and told apart by its wording.
+        const BLOCK = /suspend|violation of user polic|deactivat|account (?:has been )?(?:banned|blocked)|\\u8d26\\u6237.{0,6}(?:\\u5c01|\\u7981|\\u505c\\u7528)/i;
+        for (const el of document.querySelectorAll(
+                'div[class*="ds-alert"], div.ds-alert__content, [role="alert"]')) {
+            const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            if (txt && BLOCK.test(txt)) return txt;
+        }
+        // fall back to the page text, but only the sentence, so an unrelated
+        // footer or the history never matches
         const t = (document.body.innerText || '').replace(/\\s+/g, ' ');
-        const m = t.match(/account has been suspended[^.]*\\.?/i);
+        const m = t.match(/[^.]*?(?:suspend(?:ed)?|violation of user polic)[^.]*\\.?/i);
         return m ? m[0].trim() : '';
     }
 """
@@ -1066,6 +1114,111 @@ def save_accounts(accounts, rotate_every=None):
         return False
 
 
+def mute_left(acc):
+    """Seconds until the account's chat mute expires, or 0 when it is not muted.
+
+    DeepSeek reports the suspension as chat.is_muted + chat.mute_until in
+    /api/v0/users/current, and the web UI hides the composer while it is set.
+    We mirror that into accounts.json so rotation can skip the account instead
+    of burning four retries on a page that can never render a composer."""
+    until = acc.get("mute_until") or 0
+    try:
+        until = float(until)
+    except (TypeError, ValueError):
+        return 0
+    return max(0.0, until - time.time())
+
+
+def is_usable(acc):
+    """False while the account is still muted, so rotation passes over it."""
+    return mute_left(acc) <= 0
+
+
+# ===== USAGE STATS =====
+# Split by the DeepThink switch: "Reasoning" is the reasoner model, "Chat" is
+# plain completion. Every counter is cumulative across runs.
+USAGE_GROUPS = ("Chat", "Reasoning")
+USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                "prompt_chars", "answer_chars")
+
+
+def count_tokens(text):
+    """DeepSeek tokens, or 0 when the tokenizer is unavailable."""
+    if not text or ds_token is None:
+        return 0
+    try:
+        return len(ds_token.encode(text))
+    except Exception:
+        return 0
+
+
+class Usage:
+    """Token/character counters persisted next to the script.
+
+    Tokenizing a large prompt costs about a second, so counting happens on a
+    background thread: the request returns as soon as the answer is done, and
+    the startup screen catches up a moment later.
+    """
+
+    def __init__(self, path=STATS_FILE):
+        self.path = path
+        self.lock = threading.Lock()
+        self.groups = {g: dict.fromkeys(USAGE_FIELDS, 0) for g in USAGE_GROUPS}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+        for name, row in (saved.get("groups") or {}).items():
+            target = self.groups.setdefault(name, dict.fromkeys(USAGE_FIELDS, 0))
+            for field in USAGE_FIELDS:
+                target[field] = int(row.get(field) or 0)
+
+    def save(self):
+        with self.lock:
+            snapshot = {g: dict(r) for g, r in self.groups.items()}
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"groups": snapshot}, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)     # atomic: never a half-written stats.json
+        except Exception as e:
+            log(f"[stats] could not save: {e}", level="ERROR")
+
+    def add(self, group, prompt="", reasoning="", answer=""):
+        """Count one finished request without blocking the caller."""
+        threading.Thread(target=self._add, args=(group, prompt, reasoning, answer),
+                         daemon=True).start()
+
+    def _add(self, group, prompt, reasoning, answer):
+        row = self.groups.setdefault(group, dict.fromkeys(USAGE_FIELDS, 0))
+        with self.lock:
+            row["prompt_tokens"] += count_tokens(prompt)
+            row["completion_tokens"] += count_tokens(answer)
+            row["reasoning_tokens"] += count_tokens(reasoning)
+            row["prompt_chars"] += len(prompt)
+            row["answer_chars"] += len(answer)
+        self.save()
+
+    def snapshot(self):
+        """{group: {field: value}} plus the grand total, as a flat copy."""
+        with self.lock:
+            rows = {g: dict(r) for g, r in self.groups.items()}
+        total = dict.fromkeys(USAGE_FIELDS, 0)
+        for row in rows.values():
+            for field in USAGE_FIELDS:
+                total[field] += row.get(field, 0)
+        return rows, total
+
+
+USAGE = Usage()
+
+
 def load_accounts():
     """accounts.json format"""
     try:
@@ -1340,7 +1493,7 @@ def build_prompt(messages, tools=None):
         f"{convo}\n\n"
         f"---\n"
         f"{SYSTEM_CONTINUE}\n"
-        f"Write ONLY the Assistant's response. (Content block)"
+        f"Write Assistant's reply (ONLY content)"
     ), last_user
 
 
@@ -1773,7 +1926,7 @@ class DeepSeekSession:
     both slower and far more brittle.
     """
 
-    def __init__(self, worker_id=0, accounts=None, rotate_every=None):
+    def __init__(self, worker_id=0, accounts=None, rotate_every=None, start_idx=0):
         self.worker_id = worker_id
         self.busy = False
         self.page = None
@@ -1792,11 +1945,17 @@ class DeepSeekSession:
         self.last_debug = None
         self._search = False
         self._model_type = None
+        # The site's own words when this account is suspended, kept so the
+        # retry path can tell a ban from a plain login failure and move on.
+        self._last_ban = ''
+        # the site s banner may add wording later; print it only once
+        self._ban_announced = False
         if accounts is None:
             accounts, rotate_every = load_accounts()
         self.accounts = accounts
         self.rotate_every = rotate_every if rotate_every is not None else 10
-        self.account_idx = 0
+        # the pool deals these out round-robin, see WorkerPool._next_start_index
+        self.account_idx = start_idx
         self.requests_on_account = 0
 
     @property
@@ -1824,6 +1983,7 @@ class DeepSeekSession:
             asyncio.create_task(self._early_hide())
         self.page = await self.context.new_page()
         self.page.on("pageerror", self._on_pageerror)
+        self.page.on("response", self._on_response)
         await self._apply_account(self.current_account)
         await self._open_chat()
         # _open_chat raises unless the page is genuinely signed in, so
@@ -1840,6 +2000,36 @@ class DeepSeekSession:
         s = str(err).lower()
         if any(k in s for k in ("xhr", "network", "fetch", "timeout", "err_")):
             log(f"[page error] {err}", level="ERROR")
+
+    def _on_response(self, resp):
+        if "/api/v0/users/current" in resp.url:
+            asyncio.create_task(self._note_mute(resp))
+
+    async def _note_mute(self, resp):
+        """Mirror DeepSeek's chat mute into accounts.json.
+
+        The same field that hides the composer client-side (chat.is_muted /
+        chat.mute_until) is what the completion endpoint enforces, so a muted
+        account is written down once and then skipped by rotation until the
+        deadline passes - no need to rediscover it with four failed requests.
+        """
+        try:
+            payload = (await resp.json()).get("data") or {}
+        except Exception:
+            return
+        # the profile itself is nested: {"data":{"biz_code":0,"biz_data":{...,"chat":{...}}}}
+        user = payload.get("biz_data") or payload
+        chat = user.get("chat") or {}
+        until = chat.get("mute_until") or 0
+        if not chat.get("is_muted") or not until:
+            return
+        acc = self.current_account
+        if acc.get("mute_until") == until:
+            return
+        acc["mute_until"] = until
+        save_accounts(self.accounts, self.rotate_every)
+        log(f"[mute] account #{self.account_idx} ({self._label(self.account_idx)}) muted until "
+            f"{datetime.fromtimestamp(until):%Y-%m-%d %H:%M} - rotation skips it until then")
 
     async def _apply_account(self, acc):
         """Stage the account for the next navigation (picked up and erased by
@@ -1914,6 +2104,14 @@ class DeepSeekSession:
         """
         if await self._is_authenticated():
             return True
+        # A muted account is not a stale token. Logging in there burns a login,
+        # refreshes a token that still cannot chat, and only then reports the
+        # real reason - which is what made the log read as "noticed a stale
+        # token" for an account that was suspended all along.
+        muted = self._mute_reason()
+        if muted:
+            log(f"[auth] not signed in - {muted}", level="ERROR")
+            return False
         acc = self.current_account
         if not AUTO_REFRESH:
             log("[auth] not signed in and 'Auto Refresh Tokens' is OFF", level="ERROR")
@@ -1941,16 +2139,60 @@ class DeepSeekSession:
             return False
         return await self._is_authenticated()
 
+    async def _await_composer(self):
+        """Wait for the composer, but bail out the moment the site says this
+        account is suspended. Returns True when the composer is there."""
+        state = await poll_js(self.page, COMPOSER_OR_BAN_JS,
+                              timeout_s=CHAT_URL_READY_TIMEOUT)
+        if state == "ban":
+            raise RuntimeError(await self._no_composer_reason())
+        return state == "ready"
+
+    async def _on_sign_in_page(self):
+        """True when the site bounced us to the sign-in form.
+
+        A dead token lands here, and that page has no composer by definition -
+        waiting out CHAT_URL_READY_TIMEOUT on it means ~45s of silence before
+        the login is even attempted, which from the console looks exactly like
+        "it noticed the stale token and then did nothing"."""
+        try:
+            return "/sign_in" in (self.page.url or "")
+        except Exception:
+            return False
+
     async def _open_chat(self):
         """Load a brand-new chat. DeepSeek pre-creates a chat session on every
         page load, so navigating to '/' gives each API call a clean context."""
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-        await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT)
+        # Known mute: this page is never going to render a composer, so say so
+        # now instead of waiting out the timeout and then logging in for nothing.
+        muted = self._mute_reason()
+        if muted:
+            raise RuntimeError(muted)
+        if not await self._on_sign_in_page() and await self._await_composer():
+            return True
+        # either the composer never showed up, or we are already staring at the
+        # sign-in form - go straight for the credentials instead of waiting again
         if not await self._ensure_signed_in():
             raise RuntimeError("chat.deepseek.com is not signed in and login failed")
-        if not await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT):
+        if not await self._await_composer():
             raise RuntimeError(await self._no_composer_reason())
         return True
+
+    def _muted_until(self):
+        """The account's chat-mute deadline, or 0 when it is not muted."""
+        try:
+            return float(self.current_account.get("mute_until") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _mute_reason(self):
+        """One line saying the account cannot chat, or '' when it can."""
+        until = self._muted_until()
+        if not until or until <= time.time():
+            return ""
+        return (f"account #{self.account_idx} ({self._label(self.account_idx)}) chat is "
+                f"muted until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}")
 
     async def _no_composer_reason(self):
         """Explain a missing composer. A suspended account renders a notice
@@ -1959,17 +2201,52 @@ class DeepSeekSession:
             suspended = await self.page.evaluate(SUSPENDED_JS)
         except Exception:
             suspended = ''
-        if suspended:
-            log(f"[auth] account is blocked by DeepSeek: {suspended}", level="ERROR")
-            return f"account unavailable: {suspended}"
+        # The mute is already reported by _note_mute, which reads the API and
+        # fires long before this page renders its banner. The site's own wording
+        # is printed once, as extra detail - printing it again on every reload
+        # is what made the log look like two unrelated events minutes apart.
+        already_known = bool(self._mute_reason()) and self._ban_announced
+        if suspended and not already_known:
+            # The site states the ban in its own words, so all of it is printed -
+            # one line, same [ERROR] shape as every other line, and fully red
+            # (log() colours only the level tag, so this prints by hand).
+            R, B, D = ANSI["ERROR"], ANSI["BOLD"], ANSI["DIM"]
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            msg = (f"[account #{self.account_idx} {self._label(self.account_idx)}] "
+                   f"SUSPENDED: {suspended}")
+            try:
+                print(f"{D}{ts}{ANSI['RESET']} {R}{B}[ERROR]{ANSI['RESET']} {R}{msg}{ANSI['RESET']}",
+                      flush=True)
+                with open(LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(f"[{ts}] [ERROR] {msg}\n")
+            except Exception:
+                log(f"[account #{self.account_idx}] SUSPENDED: {suspended}", level="ERROR")
+            self._last_ban = suspended
+            self._ban_announced = True
+        if self._last_ban or self._mute_reason():
+            return (f"account suspended: {suspended}") if suspended else self._mute_reason()
         return "chat.deepseek.com never rendered the composer"
 
     # ---------------- rotation / retry ----------------
+    def pick_next_usable(self, start):
+        """Index of the next usable account after `start`, skipping the ones
+        whose chat mute has not expired yet.
+
+        Returns None when every account is still muted, so the caller can stop
+        instead of spinning on a pool that cannot serve a single request."""
+        n = len(self.accounts)
+        for step in range(1, n + 1):
+            idx = (start + step) % n
+            if is_usable(self.accounts[idx]):
+                return idx
+        return None
+
     async def switch_account(self, idx):
         log(f"[rotate] -> account #{idx} ({self._label(idx)})")
         await self._wipe()
         self.account_idx = idx
         self.requests_on_account = 0
+        self._ban_announced = False
         self._model_type = None
         await self._apply_account(self.current_account)
         await self._open_chat()
@@ -1986,11 +2263,14 @@ class DeepSeekSession:
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
         if "chat.deepseek.com" not in (self.page.url or ""):
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-        await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT)
+        if not await self._on_sign_in_page() and await self._await_composer():
+            return
+        # same as _open_chat: a reload that lands on the sign-in form has no
+        # composer coming, so do not sit out the timeout before logging in
         if not await self._ensure_signed_in():
             raise RuntimeError("page is not signed in and login failed after reload")
-        if not await poll_js(self.page, INPUT_READY_JS, timeout_s=CHAT_URL_READY_TIMEOUT):
-            raise RuntimeError("page never became ready after reload")
+        if not await self._await_composer():
+            raise RuntimeError(await self._no_composer_reason())
 
     async def _wipe(self):
         for fn in ("evaluate", "clear_cookies"):
@@ -2015,11 +2295,27 @@ class DeepSeekSession:
         except Exception:
             return False
 
+    def _log_serving(self):
+        """Which account is taking the request, and how far it is into its
+        rotation turn. Used both by before_request() and right after a ban
+        moved the request to the next account."""
+        acc = self.current_account
+        log(f"[account] serving via '{acc.get('name') or acc.get('email')}' "
+            f"({self.requests_on_account}/{self.rotate_every})")
+
     async def before_request(self):
         """Called inside the lock: rotate if this account has had its turn."""
+        # A still-muted account can never render a composer, so it never gets a
+        # turn - not on the counter, and not as the account we start out on.
+        if not is_usable(self.current_account):
+            nxt = self.pick_next_usable(self.account_idx)
+            if nxt is not None:
+                await self.switch_account(nxt)
         if ACCOUNT_ROTATE and self.requests_on_account >= self.rotate_every:
             if len(self.accounts) > 1:
-                await self.switch_account((self.account_idx + 1) % len(self.accounts))
+                nxt = self.pick_next_usable(self.account_idx)
+                if nxt is not None:
+                    await self.switch_account(nxt)
             else:
                 self.requests_on_account = 0
         self.requests_on_account += 1
@@ -2154,6 +2450,20 @@ class DeepSeekSession:
         await asyncio.sleep(0.25)             # button not rendered yet, look again
         return False
 
+    async def _stream_guarded(self):
+        """stream_tokens(), but a raised error becomes a regular 'error' event.
+
+        Without this, any exception raised while reading the page (a dead
+        worker, a navigation, a suspension notice popping up mid-stream) leaves
+        the async-for and kills the whole SSE response as a 'producer error',
+        bypassing the request-level retry. The retry block above already knows
+        what to do with an 'error' event."""
+        try:
+            async for phase, delta in self.stream_tokens():
+                yield phase, delta
+        except Exception as e:
+            yield "error", str(e)
+
     async def stream_tokens(self, timeout_s=STREAM_IDLE_TIMEOUT):
         """Poll the mirrored XHR buffer, yield (kind, delta) where kind is
         'thinking' | 'answer' | 'error' | 'done'."""
@@ -2278,7 +2588,28 @@ class WorkerPool:
         self._workers = []            # all DeepSeekSession ever created
         self._idle = []               # free workers (queue discipline)
         self._counter = 0
+        self._handed_out = 0          # how many accounts have been dealt already
         self._hider_task = None
+
+    def _next_start_index(self):
+        """Hand each new worker a different account, round-robin.
+
+        Every worker used to start at index 0, so with a suspended account first
+        they all jumped to "the first usable one after 0" - the same account,
+        every time. N browsers then hammered one account, and because
+        requests_on_account is per-worker each of them reported (1/2) and the
+        rotate_every budget was silently multiplied by the pool size.
+        """
+        n = len(self._accounts)
+        for step in range(n):
+            idx = (self._handed_out + step) % n
+            if is_usable(self._accounts[idx]):
+                self._handed_out = (idx + 1) % n
+                return idx
+        # every account is muted: the worker starts at 0 and before_request()
+        # reports it rather than pretending the pool has somewhere to go
+        self._handed_out = (self._handed_out + 1) % n
+        return 0
 
     async def acquire(self):
         """Return a worker, spawning a fresh browser if none is idle."""
@@ -2291,6 +2622,7 @@ class WorkerPool:
                 worker_id=self._counter,
                 accounts=self._accounts,
                 rotate_every=self._rotate_every,
+                start_idx=self._next_start_index(),
             )
             self._counter += 1
             self._workers.append(wk)
@@ -2586,8 +2918,8 @@ async def chat_completions(request: Request):
         try:
             try:
                 await wk.rate_limit()
-                acc = await wk.before_request()
-                log(f"[account] serving via '{acc.get('name') or acc.get('email')}' ({wk.requests_on_account}/{wk.rotate_every})")
+                await wk.before_request()
+                wk._log_serving()
             except Exception as e:
                 log(f"prepare/send failed: {e}", level="ERROR")
                 yield sse({"error": {"message": str(e), "type": "proxy_error"}})
@@ -2619,7 +2951,7 @@ async def chat_completions(request: Request):
                     fail_reason = str(e)
 
                 if fail_reason is None:
-                    async for phase, delta in wk.stream_tokens():
+                    async for phase, delta in wk._stream_guarded():
                         if phase == "error":
                             # fail_reason = ("captcha appeared"
                             #                if delta == "captcha" else delta)
@@ -2629,6 +2961,14 @@ async def chat_completions(request: Request):
                             answer_started = True
                             full_reasoning.append(delta)
                             yield sse(make_chunk(chunk_id, created, req_model, {"reasoning_content": delta}))
+                            continue
+
+                        # No tools on this request: stream the text straight
+                        # through, there is no markup to capture.
+                        if tool_buf is None:
+                            answer_started = True
+                            full_answer.append(delta)
+                            yield sse(make_chunk(chunk_id, created, req_model, {"content": delta}))
                             continue
 
                         # The buffer hands back ordered events, so text written
@@ -2689,7 +3029,30 @@ async def chat_completions(request: Request):
                         yield sse({"error": {"message": fail_reason, "type": "proxy_error"}})
                         yield "data: [DONE]\n\n"
                         return
-                    log(f"[request] {fail_reason} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
+                    # A ban was already printed in full and in red, so the
+                    # retry line only says it happened - no second copy of the
+                    # site's wording.
+                    why = "account suspended" if "account suspended" in fail_reason else fail_reason
+                    log(f"[request] {why} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
+                    # A suspended account never recovers on reload, so spend the
+                    # retry on the next one instead of the same dead account.
+                    if getattr(wk, "_last_ban", "") and len(wk.accounts) > 1:
+                        wk._last_ban = ''
+                        nxt = wk.pick_next_usable(wk.account_idx)
+                        if nxt is None:
+                            # every account is muted: none of them can render a
+                            # composer, so retrying cannot help
+                            log("[request] every account is muted - nothing to rotate to", level="ERROR")
+                            yield sse({"error": {"message": fail_reason, "type": "proxy_error"}})
+                            yield "data: [DONE]\n\n"
+                            return
+                        try:
+                            await wk.switch_account(nxt)
+                            wk.requests_on_account = 1
+                            wk._log_serving()
+                        except Exception as e:
+                            fail_reason = str(e)
+                        continue
                     try:
                         await wk.reload_current()
                     except Exception as e:
@@ -2734,7 +3097,10 @@ async def chat_completions(request: Request):
             finally:
                 log(f"--> done: reasoning={sum(len(x) for x in full_reasoning)}ch "
                     f"answer={sum(len(x) for x in full_answer)}ch "
-f"prompt_len={prompt_len} | model={req_model}", level="OK")
+                    f"prompt_len={prompt_len} | model={req_model}", level="OK")
+                USAGE.add("Reasoning" if thinking else "Chat", prompt,
+                          reasoning="".join(full_reasoning),
+                          answer="".join(full_answer))
                 with open("last_response.json", "w", encoding="utf-8") as f:
                     json.dump({"reasoning": "".join(full_reasoning), "answer": "".join(full_answer)},
                               f, ensure_ascii=False, indent=2)
@@ -2775,7 +3141,7 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
                 fail_reason = str(e)
 
             if fail_reason is None:
-                async for phase, delta in wk.stream_tokens():
+                async for phase, delta in wk._stream_guarded():
                     if phase == "error":
                         fail_reason = delta
                         break
@@ -2821,7 +3187,25 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
                 if retries >= MAX_REQUEST_RETRIES:
                     log(f"[request] giving up after {retries} retries: {fail_reason}", level="ERROR")
                     return JSONResponse({"error": {"message": fail_reason}}, status_code=502)
-                log(f"[request] {fail_reason} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
+                why = "account suspended" if "account suspended" in fail_reason else fail_reason
+                log(f"[request] {why} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
+                # A suspended account never recovers on reload, so spend the
+                # retry on the next one instead of the same dead account.
+                if getattr(wk, "_last_ban", "") and len(wk.accounts) > 1:
+                    wk._last_ban = ''
+                    nxt = wk.pick_next_usable(wk.account_idx)
+                    if nxt is None:
+                        # every account is muted: none of them can render a
+                        # composer, so retrying cannot help
+                        log("[request] every account is muted - nothing to rotate to", level="ERROR")
+                        return sse({"error": {"message": fail_reason, "type": "proxy_error"}})
+                    try:
+                        await wk.switch_account(nxt)
+                        wk.requests_on_account = 1
+                        wk._log_serving()
+                    except Exception as e:
+                        fail_reason = str(e)
+                    continue
                 try:
                     await wk.reload_current()
                 except Exception as e:
@@ -2839,6 +3223,8 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
     log(f"--> done: reasoning={sum(len(x) for x in reasoning_parts)}ch "
         f"answer={sum(len(x) for x in answer_parts)}ch "
         f"prompt_len={prompt_len} | model={req_model}", level="OK")
+    USAGE.add("Reasoning" if thinking else "Chat", prompt,
+              reasoning="".join(reasoning_parts), answer="".join(answer_parts))
     if has_tools and all_calls:
         message["tool_calls"] = [{
             "id": "call_" + secrets.token_hex(8),
@@ -2882,8 +3268,6 @@ LOGO = r"""███████╗██████╗ ███████�
 ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝    ╚═════╝ ╚══════╝╚══════╝╚═╝     ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝     ╚═╝  ╚═╝╚═╝     ╚═╝"""
 
 
-
-
 RESET = "\x1b[0m"
 
 
@@ -2902,7 +3286,14 @@ def _enable_ansi():
 
 
 def _clear():
-    os.system("cls" if os.name == "nt" else "clear")
+    """Blank the screen, and put the mouse mode back if it was on."""
+    # Not os.system("cls"): that spawns cmd.exe, which inherits the console and
+    # leaves its own input mode behind on the way out - Quick Edit comes back, the
+    # wheel is swallowed again, and it only ever scrolls once.
+    sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+    sys.stdout.flush()
+    if os.name == "nt" and globals().get("_OLD_MODE") is not None:
+        _mouse_console(True)        # in case anything above reset the mode
 
 
 def _tick(on):
@@ -2939,6 +3330,11 @@ def _ensure_terminal_width(min_w=None):
     honoured by xterm and every emulator that follows it (kitty, alacritty,
     wezterm, gnome-terminal, konsole, foot, iTerm2). One that does not simply
     ignores the bytes, so this is safe to send without probing first.
+
+    Only the width is touched. The height is left to the terminal: Windows
+    always keeps one spare row when it grows a window, so asking for an exact
+    height lands on a screen one row bigger than the block and puts a blank line
+    at the bottom. The menu is laid out to fit the window instead.
     """
     global _LAST_AUTO_WIDTH
     if min_w is None:
@@ -2951,13 +3347,18 @@ def _ensure_terminal_width(min_w=None):
         return cur
     _LAST_AUTO_WIDTH = min_w
     try:
-        import shutil
         rows = max(shutil.get_terminal_size().lines, 25)
-        sys.stdout.write("[8;%d;%dt" % (rows, min_w))
+        sys.stdout.write("\x1b[8;%d;%dt" % (rows, min_w))
         sys.stdout.flush()
     except Exception:
         return cur
-    time.sleep(0.2)  # let the emulator apply it before we measure again
+    # Do NOT settle for a fixed pause: the emulator applies the resize on its
+    # own schedule, and the first frame is laid out from whatever width is in
+    # effect when it is drawn. Returning early is what clipped the banner - the
+    # layout was measured against the old width and nothing repainted it later.
+    deadline = time.time() + RESIZE_WAIT
+    while time.time() < deadline and _term_width() < min_w:
+        time.sleep(0.02)
     grown = _term_width()
     if grown < min_w:
         # Keep _LAST_AUTO_WIDTH set so we do not spam a terminal that will
@@ -3000,19 +3401,22 @@ def _gradient_lines(lines, width):
     return out
 
 
-def _render_menu():
-    _enable_ansi()
-    _clear()
-    w = _ensure_terminal_width()
-    for line in _gradient_lines(LOGO.splitlines(), w):
-        print(line)
-    print()
-    table = [
+def _menu_table():
+    """The option table, as plain rows. The ON/OFF ticks carry colour, so the
+    cells are returned as (visible_text, ansi_text) pairs."""
+    on, off = "\x1b[32mON\x1b[0m", "\x1b[31mOFF\x1b[0m"
+    tick = lambda flag: on if flag else off
+    return [
         ["[1] Start", f"[4] API Port: {PORT}", "[7] GitHub"],
-        [f"[2] {_tick(AUTO_REFRESH)} Auto Refresh Tokens", "[5] Open accounts.json", "[8] Exit"],
-        [f"[3] {_tick(ACCOUNT_ROTATE)} Account Rotate", f"[6] {_tick(HEADLESS)} Hide Window", ""],
+        [f"[2] {tick(AUTO_REFRESH)} Auto Refresh Tokens", "[5] Open accounts.json", "[8] Exit"],
+        [f"[3] {tick(ACCOUNT_ROTATE)} Account Rotate", f"[6] {tick(HEADLESS)} Hide Window", ""],
     ]
-    # is then separated by exactly COL_GAP spaces, so all rows align perfectly.
+
+
+def _menu_table_text(width):
+    """The option table, centred as one block so all three rows share the same
+    left offset (otherwise each row centres itself and the columns drift)."""
+    table = _menu_table()
     COL_GAP = 3
     ncols = max(len(r) for r in table)
     col_w = [max(_visible_len(r[i]) if i < len(r) else 0 for r in table) for i in range(ncols)]
@@ -3025,13 +3429,146 @@ def _render_menu():
             if i < ncols - 1:
                 line += " " * COL_GAP
         rows.append(line)
-    # Center the whole block as one unit so EVERY row shares the SAME left
-    # offset (otherwise each row centers itself and the columns drift apart).
-    block_w = max(_visible_len(r) for r in rows)
-    left = max(0, (w - block_w) // 2)
-    for r in rows:
-        print(" " * left + r)
-    print()
+    left = max(0, (width - max(_visible_len(r) for r in rows)) // 2)
+    return "\n".join(" " * left + r for r in rows)
+
+
+# Rows that share the token scale; Characters is not one of them, it is counted
+# in symbols and would print 400% on a token scale.
+_TOKEN_ROWS = ("Prompt Tokens", "Completion Tokens", "Reasoning Tokens", "Tokens")
+
+
+def _metric_values(row):
+    """Counters in the order they are shown, including the derived totals."""
+    return [
+        ("Prompt Tokens", row["prompt_tokens"]),
+        ("Completion Tokens", row["completion_tokens"]),
+        ("Reasoning Tokens", row["reasoning_tokens"]),
+        ("Tokens", row["prompt_tokens"] + row["completion_tokens"]),
+        ("Characters", row["prompt_chars"] + row["answer_chars"]),
+    ]
+
+
+def _spaced(n):
+    """1 234 567 - thin spaces, the way the counters are read out loud."""
+    return f"{int(n):,}".replace(",", " ")
+
+
+def room_for(head, width, extra=6):
+    """How many cells a bar may take on a row that already starts with `head`.
+
+    The bar is sized from the row being built rather than from a hand-counted
+    constant, so no column can be added or removed without the width following.
+    The line must stay shorter than the terminal: one that fills it exactly
+    leaves the cursor in pending-wrap, and the row count the caret arithmetic
+    depends on stops being reliable. `extra` covers the " |" separators plus the
+    spare column, and any "|  n%" already appended to the head.
+    """
+    return max(10, width - _visible_len(head) - extra)
+
+
+# The bars use the banner's palette, so the screen reads as one thing, but each
+# bar runs the ramp along its own length instead of continuing the banner's
+# 45-degree diagonal - the banner is a picture, the counters are a scale.
+def _bar(fraction, width, minimum=False):
+    filled = int(round(fraction * width))
+    if minimum and filled == 0:
+        filled = 1                      # real usage must not render as an empty bar
+    cells = []
+    for i in range(width):
+        if i < filled:
+            cells.append(_ansi_color(i / max(1, width - 1)) + "█" + RESET)
+        else:
+            cells.append(ANSI["DIM"] + "." + RESET)
+    return "".join(cells)
+
+
+# Group key -> heading. The split follows the reasoning switch, so it tracks
+# what actually costs tokens rather than the model list, which the site serves
+# dynamically.
+GROUP_TITLES = (("Chat", "DeepSeek Chat"), ("Reasoning", "DeepSeek Reasoning"))
+
+
+def _stats_lines(width):
+    """The usage block, flush left, with bars sized to the current terminal.
+
+    Each bar is that group's share of the same counter across everything, so
+    the numbers stay meaningful without inventing a quota: "All" is always
+    100% and a group is whatever slice of it it has actually used."""
+    rows, total = USAGE.snapshot()
+    if not any(total.values()):
+        # Nothing has been served yet (a fresh stats.json). A block of zeroes
+        # and full bars says less than showing no block at all.
+        return []
+    grand = _metric_values(total)
+    grand_map = dict(grand)
+
+    # The number column is sized to the widest value the block will actually
+    # print, not to a fixed width: a block that has not grown past six digits
+    # should not be padded to room for eleven, and one that has should not
+    # start shoving its bars off the right edge.
+    per_group = {g: _metric_values(rows.get(g) or dict.fromkeys(USAGE_FIELDS, 0))
+                 for g, _ in GROUP_TITLES}
+    every = list(grand) + [v for values in per_group.values() for v in values]
+    value_w = max((len(_spaced(v)) for _, v in every), default=1)
+
+    out = [" Stats:"]
+
+    # One denominator per block, stated once, and it is the headline number the
+    # eye lands on: total Tokens. Everything else is read against that, so
+    # "Completion Tokens: 199 | 1%" means 199 out of 20 972 rather than 199 out
+    # of 199 - which is how it read before, sitting right above a Tokens row and
+    # claiming 100%.
+    #
+    # Characters is deliberately left out of the bars. Symbols outnumber tokens
+    # about four to one, so sharing that scale would print 400%; a row that
+    # cannot live in the same unit is printed as a plain number instead of
+    # given a scale it does not belong to.
+    # Every row is measured against the SAME counter in the All block, never
+    # against its own group's total: "Completion Tokens: 143" next to "Tokens"
+    # must read as a share of all tokens, and showing 100% because 143 is all of
+    # this group's completion tokens is true but useless. Characters is a
+    # different unit - symbols outnumber tokens about four to one - so it is
+    # measured against All Characters, the one comparison that holds.
+    token_total = grand_map.get("Tokens", 0)
+    chars_total = grand_map.get("Characters", 0)
+
+    def pct_text(share):
+        # A real but tiny share must not round to a flat "0%": that would say a
+        # group did nothing when it did.
+        if share >= 1:
+            return str(int(round(share)))
+        if share >= 0.01:
+            return f"{share:.2f}"
+        return "<0.01"
+
+    def block(title, values, is_total):
+        lines = [f"  {title}:"]
+        for name, value in values:
+            if not value and not is_total:
+                continue                      # a group without reasoning shows no reasoning row
+            label = name.rjust(17)
+            head = f"  - {label}: {_spaced(value).rjust(value_w)}"
+            if is_total:
+                lines.append(f"{head} | {_bar(1.0, room_for(head, width))} |")
+                continue
+            whole = chars_total if name == "Characters" else token_total
+            share = (value * 100 / whole) if whole else 0.0
+            head += f" | {pct_text(share).rjust(4)}%"
+            # The bar is sized from the row that is actually being built, so the
+            # line can never reach the terminal width. room_for() has to see the
+            # percentage too: measuring the head before the "|  93%" is appended
+            # leaves the row several columns too long, which is how a bar ends up
+            # wrapping the line and dragging the whole block down.
+            room = room_for(head, width)
+            lines.append(f"{head} | {_bar(share / 100, room, minimum=bool(value))} |")
+        return lines
+
+    out += block("All", grand, True)
+    for group, title in GROUP_TITLES:
+        if any(rows.get(group, {}).values()):
+            out += [""] + block(title, per_group[group], False)
+    return out
 
 
 def open_accounts_file():
@@ -3061,13 +3598,421 @@ def open_github():
         log(f"[menu] could not open GitHub: {e}", level="ERROR")
 
 
+def _repaint_band(lines, first_row):
+    """Redraw a screen band in place, leaving the rest of the screen alone.
+
+    The whole screen is not cleared: only the rows that changed, one cursor
+    move each and an erase-to-end-of-line. That is what keeps a wheel step from
+    flashing - the banner is thousands of escape bytes per character, and
+    reprinting it takes long enough for the blank frame to be visible.
+    """
+    out = [f"\x1b[{first_row};1H"]
+    for i, line in enumerate(lines):
+        if i:
+            out.append("\r\n\x1b[%d;1H" % (first_row + i))
+        out.append(line)
+        out.append("\x1b[K")          # wipe what the old row left behind
+    sys.stdout.write("".join(out))
+
+def _render_menu(typed="", scroll=0, fresh=True):
+    """Draw the whole startup screen once, then hand the caret to the prompt.
+
+    Plain output, one pass, and a single cursor move afterwards. Nothing is
+    ever repainted in place, so there is no cursor arithmetic to drift: the rows
+    between the prompt and the counters are counted from the block that was just
+    printed, which is known exactly.
+
+    The prompt is drawn BEFORE the counters so it reads top-down, and the caret
+    is then walked back up to it, which is why the user can type into a line that
+    has something under it.
+    """
+    # The width first: the bars are sized from it, so the block has to be built
+    # before the height is known.
+    w = _ensure_terminal_width(_logo_width() + 8)
+    # Build everything that is not stats first and count the rows it takes, so
+    # the stats block is cut against what is really left of the screen. Counting
+    # the parts separately is where this goes wrong: the option table is one
+    # string holding three lines, so a formula over the pieces is off by two.
+    body = list(_gradient_lines(LOGO.splitlines(), w))
+    body.append("")
+    body.append(_menu_table_text(w))
+    body.append("")
+    prompt = f" Choice: {typed}"
+    body.append(prompt)
+    # Count the rows everything but stats takes, from the block that was really
+    # built - the option table is one string holding three lines, so a formula
+    # over the parts is off by two. The stats block gets whatever is left.
+    chrome_rows = sum(line.count(chr(10)) + 1 for line in body)
+    chrome_rows += 1              # the blank line that goes above the stats block
+    counters, max_scroll = _stats_viewport(w, scroll, chrome_rows)
+    if counters:
+        body.append("")
+    body.extend(counters)
+    prompt_row = sum(line.count(chr(10)) + 1 for line in body[:body.index(prompt)])
+    stats_row = body.index(counters[0]) if counters else -1
+
+    # A wheel step must not wipe the screen. The stats band is the only part that
+    # changes, and while it overflows its height does not change either, so it can
+    # be repainted in place between the prompt and the bottom of the screen.
+    if not fresh and counters and prompt_row >= 0 and stats_row >= 1:
+        rows = sum(line.count(chr(10)) + 1 for line in body[:stats_row])
+        _repaint_band(counters, rows + 1)
+        sys.stdout.write(f"[{prompt_row + 1};{len(prompt) + 1}H")
+        sys.stdout.flush()
+        return max_scroll
+
+    _clear()
+    for line in body:
+        print(line)
+    # Walk the caret back to the end of the prompt so the input types into it.
+    # print() already moved the caret one row PAST the prompt line, so the rows to
+    # cross are that consumed row plus, when the counters are there, a blank line
+    # and every counter row. With no counters at all only the first applies. And
+    # CSI n A only changes the row: the column is still 0 after a newline, so
+    # without the trailing CSI n C the caret would sit before the prompt text and
+    # the first keystroke would land in front of it.
+    # How many rows sit between the prompt and the caret: everything printed
+    # below it, plus the row the final newline left the caret on. Counted from
+    # the block rather than from the counters, because the hint and the blank
+    # lines are rows too and hand-counting them is how this used to go wrong.
+    rows_below = sum(line.count(chr(10)) + 1 for line in body[body.index(prompt) + 1:])
+    crossed = rows_below + 1
+    sys.stdout.write(f"\x1b[{crossed}A\x1b[{len(prompt)}C")
+    sys.stdout.flush()
+    return max_scroll
+
+
+def _stats_viewport(w, offset, chrome):
+    """The stats block as it fits on screen, starting at `offset`.
+
+    The whole screen is held to the terminal height minus one row: the last row
+    is left free, because a terminal that scrolls shifts every row and the caret
+    walk at the end of _render_menu counts them. The heading itself is pinned: the
+    rows under it are what the wheel moves, so the block keeps its heading no
+    matter how far it is scrolled. When the whole thing fits there is nothing to
+    scroll and the block is returned as is.
+    """
+    counters = _stats_lines(w)
+    if not counters:
+        return [], 0
+    height = _term_height()
+    if not height:            # size unknown: no guessing, show the whole block
+        return counters, 0
+    head, rows = counters[0], counters[1:]
+    # the block is chrome + a blank line + this heading + the rows below it, and
+    # all of it has to fit in the height minus one row, so the rows get the rest
+    room = height - 3 - chrome
+    if room < 1:
+        return [], 0        # not even a heading and one row: no stats block
+    if len(rows) <= room:
+        return counters, 0
+    last = len(rows) - room
+    offset = max(0, min(offset, last))
+    # the heading has to say the block is cut, or a half-looking list of counters
+    # reads as the whole thing
+    head = head.replace("Stats:", "Stats (scroll):")
+    return [head] + rows[offset:offset + room], last
+
+
+def _term_height():
+    """Rows on the visible screen, or 0 when it cannot be measured."""
+    try:
+        return os.get_terminal_size().lines
+    except Exception:
+        return 0
+
+
+# --- input ---------------------------------------------------------------------
+# On Windows the wheel is not a character: it arrives as a MOUSE_EVENT record in
+# the console input buffer, and ReadConsoleW - which is what msvcrt.getwch() calls
+# - never returns records. Two things are needed and both were missing at once:
+#   * ENABLE_MOUSE_INPUT in the console mode, without which the console does not
+#     generate mouse events at all and the wheel is never reported;
+#   * the right event type: MOUSE_EVENT is 0x0002, while 0x0004 is MENU_EVENT, so
+#     a record that does arrive gets thrown away by a wrong comparison.
+# Set PROXY_DEBUG_INPUT=1 to see every input event reach the menu.
+_DEBUG_INPUT = bool(os.environ.get("PROXY_DEBUG_INPUT"))
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _K = ctypes.WinDLL("kernel32", use_last_error=True)
+    _K.GetStdHandle.restype = wintypes.HANDLE
+    _K.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _K.GetConsoleMode.restype = wintypes.BOOL
+    _K.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _K.SetConsoleMode.restype = wintypes.BOOL
+    _K.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _K.WaitForSingleObject.restype = wintypes.DWORD
+    _K.ReadConsoleInputW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD)]
+    _K.ReadConsoleInputW.restype = wintypes.BOOL
+
+    _KEY_EVENT = 0x0001
+    _MOUSE_EVENT = 0x0002
+    _MOUSE_WHEELED = 0x0004
+    _ENABLE_MOUSE_INPUT = 0x0010
+    _ENABLE_EXTENDED_FLAGS = 0x0080
+    # Quick Edit is on by default and it swallows the wheel for text selection
+    # instead of letting the events reach the input buffer, so it has to go.
+    _ENABLE_QUICK_EDIT = 0x0040
+
+    # the virtual keys that move a view
+    _SCROLL_KEYS = {0x26: -1, 0x28: 1, 0x21: -3, 0x22: 3}    # up, down, PgUp, PgDn
+    _SPECIAL_KEYS = {0x0D: "\r", 0x08: "\x7f", 0x1B: "\x1b", 0x09: "\t"}
+    _OLD_MODE = None
+
+    class _Coord(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class _KeyRecord(ctypes.Structure):
+        _fields_ = [("keyDown", wintypes.BOOL), ("repeatCount", wintypes.WORD),
+                    ("keyCode", wintypes.WORD), ("scanCode", wintypes.WORD),
+                    ("char", wintypes.WCHAR), ("control", ctypes.c_ubyte * 8)]
+
+    class _MouseRecord(ctypes.Structure):
+        _fields_ = [("pos", _Coord), ("buttonState", wintypes.DWORD),
+                    ("control", wintypes.DWORD), ("flags", wintypes.DWORD)]
+
+    class _Record(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("key", _KeyRecord), ("mouse", _MouseRecord)]
+        _fields_ = [("kind", wintypes.WORD), ("u", _U)]
+
+    def _mouse_console(on):
+        """Mouse reports from the console itself, restoring the old mode after."""
+        global _OLD_MODE
+        handle = _K.GetStdHandle(-10)
+        mode = wintypes.DWORD()
+        if not _K.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        if on:
+            if _OLD_MODE is None:
+                _OLD_MODE = mode.value
+            _K.SetConsoleMode(handle, (mode.value | _ENABLE_MOUSE_INPUT
+                                     | _ENABLE_EXTENDED_FLAGS) & ~_ENABLE_QUICK_EDIT)
+        elif _OLD_MODE is not None:
+            _K.SetConsoleMode(handle, _OLD_MODE)
+            _OLD_MODE = None
+
+    def _win_event(rec):
+        """One console record as a scroll delta, a character, or None to skip."""
+        if rec.kind == _MOUSE_EVENT:
+            if not rec.u.mouse.flags & _MOUSE_WHEELED:
+                return None
+            # the step is a signed value in the high word; a plain shift would read
+            # an upward wheel as 65535 and then call it a downward one
+            step = ctypes.c_short(rec.u.mouse.buttonState >> 16).value
+            return -1 if step > 0 else 1
+        if rec.kind != _KEY_EVENT or not rec.u.key.keyDown:
+            return None
+        vk = rec.u.key.keyCode
+        if vk in _SCROLL_KEYS:
+            return _SCROLL_KEYS[vk]
+        if vk in _SPECIAL_KEYS:
+            return _SPECIAL_KEYS[vk]
+        ch = rec.u.key.char
+        if not ch:
+            return None
+        if ord(ch) == 32 and vk != 0x20:
+            return None        # a key that types nothing leaves a space behind
+        if ord(ch) >= 32 or ch == "\x03":
+            return ch           # printable, and Ctrl+C which the console sends as 3
+        return None
+
+    def _getch():
+        """One input event: a character, or a scroll delta."""
+        if _PENDING_KEY:
+            return _PENDING_KEY.pop(0)
+        if os.name == "nt":
+            handle = _K.GetStdHandle(-10)
+            rec, got = _Record(), wintypes.DWORD()
+            while True:
+                _K.WaitForSingleObject(handle, 1000)
+                if not _K.ReadConsoleInputW(handle, ctypes.byref(rec),
+                                            ctypes.sizeof(rec), ctypes.byref(got)) or not got.value:
+                    continue
+                event = _win_event(rec)
+                if event is not None:
+                    return event
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+
+# How long a wheel gesture is allowed to keep feeding us events before the screen
+# is repainted, and where a key waits if it turns up in the middle of one.
+SCROLL_DRAIN = 0.03
+_PENDING_KEY = []
+
+
+def _getch_nowait():
+    """One input event if one is already waiting, else None. Never blocks."""
+    if _PENDING_KEY:
+        return _PENDING_KEY.pop(0)
+    if os.name == "nt":
+        handle = _K.GetStdHandle(-10)
+        if _K.WaitForSingleObject(handle, 0) != 0:
+            return None
+        rec, got = _Record(), wintypes.DWORD()
+        if not _K.ReadConsoleInputW(handle, ctypes.byref(rec), ctypes.sizeof(rec),
+                                    ctypes.byref(got)) or not got.value:
+            return None
+        return _win_event(rec)
+    return None            # no non-blocking read to borrow on this platform
+
+
+def _scroll_mouse(on):
+    """Ask the terminal to report the wheel. Not needed on Windows, where the
+    console reports it on its own once ENABLE_MOUSE_INPUT is set."""
+    if os.name == "nt":
+        _mouse_console(on)
+        return
+    sys.stdout.write("\x1b[?1000h\x1b[?1006h" if on else "\x1b[?1006l\x1b[?1000l")
+    sys.stdout.flush()
+
+
+def _read_event(getch):
+    """One key or one scroll delta, from either kind of terminal."""
+    ch = getch()
+    if isinstance(ch, int) or ch != "\x1b":
+        return ch
+    # SGR mouse report: ESC [ < button ; col ; row M, where 64 is up and 65 down
+    seq = [ch]
+    for _ in range(12):
+        try:
+            nxt = getch()
+        except Exception:
+            break
+        if not isinstance(nxt, str):
+            return nxt
+        seq.append(nxt)
+        if nxt in ("M", "m") and len(seq) > 2:
+            m = re.match(r"\x1b\[<(\d+);\d+;\d+[Mm]$", "".join(seq))
+            if not m:
+                return None
+            button = int(m.group(1))
+            return -1 if button == 64 else (1 if button == 65 else None)
+        if not (nxt.isdigit() or nxt in ";<["):
+            break
+    return None
+
+
+def _input_limit(prompt=" Choice: "):
+    """How many characters still fit on the prompt line.
+
+    One column is left over on purpose: a line that reaches exactly the terminal
+    width wraps, and a wrapped input line pushes the whole block down - the
+    'Stats' heading disappears and the bars smear. The caret arithmetic further
+    down depends on those rows staying put.
+    """
+    return max(1, _term_width() - _visible_len(prompt) - 1)
+
+
+def _read_line(limit, getch=None, on_scroll=None, mouse=False):
+    """Read a single line, echoing as we go, and never let it exceed `limit`.
+
+    input() has no such cap, and the menu screen is already drawn underneath the
+    prompt, so a line that wraps does not just look wrong - it moves the counters
+    the caret was just walked up from.
+
+    A scroll event is not a keystroke: it moves the stats block through on_scroll
+    and stays out of the text. Reporting is switched on only when the caller says
+    the block overflows, so a menu that fits leaves the mouse to the terminal.
+    """
+    if getch is None and not sys.stdin.isatty():   # piped: nothing to echo
+        return input()
+    getch = getch or _getch
+    if mouse:
+        _scroll_mouse(True)
+    buf = ""
+    try:
+        while True:
+            key = _read_event(getch)
+            if key is None:                         # a sequence that is not ours
+                continue
+            if isinstance(key, int) and on_scroll:  # a scroll, not a key
+                # One notch of the wheel is not one event: Windows sends several
+                # records for it, and redrawing per record means clearing the
+                # screen several times a gesture - the terminal visibly blanks.
+                # Take everything that is already queued, one repaint per gesture.
+                total = key
+                waited = 0.0
+                while waited < SCROLL_DRAIN:
+                    nxt = _getch_nowait()
+                    if nxt is None:
+                        waited += 0.005
+                        continue
+                    waited = 0.0
+                    if isinstance(nxt, int):
+                        total += nxt
+                    else:
+                        _PENDING_KEY.append(nxt)    # a key arrived, keep it
+                        break
+                if _DEBUG_INPUT:
+                    print(f"[input] scroll {total:+d}", file=sys.stderr, flush=True)
+                on_scroll(total, buf)
+                continue
+            ch = key
+            if ch in ("\r", "\n"):
+                return buf
+            if ch == "\x03":                        # Ctrl+C
+                raise KeyboardInterrupt
+            if ch in ("\x7f", "\x08"):             # Backspace
+                if buf:
+                    buf = buf[:-1]
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if len(buf) < limit and (ch.isprintable() or ch == " "):
+                buf += ch
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            # anything past the limit is dropped, so the line cannot wrap
+    finally:
+        if mouse:
+            _scroll_mouse(False)
+
+
 async def run_menu():
     """Interactive startup menu. Returns when the user picks [1] Start."""
     global PORT, HEADLESS, ACCOUNT_ROTATE, AUTO_REFRESH
     while True:
-        _render_menu()
+        # Ask for a bit more than the banner needs, otherwise a terminal only a
+        # few columns wider than the logo leaves it flush against both edges and
+        # it reads as clipped.
+        _enable_ansi()
+        _ensure_terminal_width(_logo_width() + 8)
+        # How far the stats block can be scrolled: zero when it fits, and then
+        # the mouse is left alone entirely - no reporting, no stolen clicks, and
+        # the terminal keeps its own text selection and wheel scrolling.
+        max_scroll = _render_menu()
+        scroll = 0
+
+        def on_scroll(delta, typed):
+            nonlocal scroll
+            moved = max(0, min(scroll + delta, max_scroll))
+            if moved != scroll:            # at an end there is nothing to redraw
+                scroll = moved
+                # only the stats band moves on a scroll, so the rest of the
+                # screen is left exactly where it is
+                _render_menu(typed, scroll, fresh=False)
+
         try:
-            choice = input(" Choice: ").strip()
+            # The mouse is only taken while the stats block has something to
+            # scroll: capturing it means turning Quick Edit off, and with that
+            # gone the user cannot select text in the terminal. A block that fits
+            # needs no wheel, so the mouse stays theirs.
+            choice = _read_line(_input_limit(), on_scroll=on_scroll,
+                                mouse=max_scroll > 0).strip()
         except (EOFError, KeyboardInterrupt):
             # Ctrl+C at the main prompt exits the program
             _clear()
@@ -3094,18 +4039,12 @@ async def run_menu():
                 log(f"[menu] invalid port: {new_port!r}", level="ERROR")
         elif choice == "5":
             open_accounts_file()
-            try:
-                input("\n Press Enter to continue...")
-            except (EOFError, KeyboardInterrupt):
-                pass
+            input("\n Press Enter to continue...")
         elif choice == "6":
             HEADLESS = not HEADLESS
         elif choice == "7":
             open_github()
-            try:
-                input("\n Press Enter to continue...")
-            except (EOFError, KeyboardInterrupt):
-                pass
+            input("\n Press Enter to continue...")
         elif choice == "8":
             _clear()
             log("[menu] exited")

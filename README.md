@@ -293,6 +293,32 @@ only to satisfy the client.
   that drifts. The OpenAI-shaped field names (`prompt_tokens` and friends) are kept because clients
   expect them; they now carry characters. The `context` / `output` above are 2621440, the site's own
   `input_character_limit`, identical for all three model types.
+- The **startup screen** counts differently. It tokenises with `deepseek-tokenizer` and keeps real
+  token counts (prompt, completion, reasoning) next to character counts, split into `Chat` and
+  `Reasoning` by the DeepThink switch. They accumulate in `stats.json` next to the script, are
+  reloaded on every start, and each row's bar shows that group's share of the same counter across
+  everything, so `All` is always 100%. Tokenising happens on a background thread: a large prompt
+  costs about a second, and the request should not wait for it.
+- The startup screen is plain printed output: banner, option table, the ` Choice: ` line, then the
+  counters, and a single `CSI n A` afterwards to walk the caret back up to the prompt. The rows the
+  move crosses are counted from the block that was just printed, so there is no cursor arithmetic
+  that can drift. Two details are load-bearing:
+  - a terminal narrower than the banner is asked to grow via XTWINOPS, and the wait is a poll on the
+    actual width rather than a fixed pause. A fixed pause lost that race: the first frame was laid out
+    against the old width and the banner came out clipped. The request is for the banner width plus a
+    margin, so the logo is not flush against both edges either;
+  - a counter row is printed one column short of the terminal width. A row that fills the width
+    exactly leaves the cursor in pending-wrap, and the row count the caret move depends on stops being
+    reliable.
+- If the counters do not fit the window they are cut to it and the heading says so, as
+  `Stats (scroll):`. The mouse wheel or `up`/`down` and `PageUp`/`PageDown` move the block one row at a
+  time and the heading stays pinned. On Windows the wheel comes from the console as a mouse event
+  rather than as characters, so mouse reporting is only switched on while there is something to scroll
+  - that is what turns Quick Edit off, and with it off the terminal cannot select text; hold `Shift`
+  while dragging to select anyway. A wheel step repaints the counter band in place and never clears
+  the screen, otherwise reprinting the banner - a colour code per character - leaves a visible blank
+  frame.
+
 - The two switches are the real `div.ds-toggle-button` controls in the composer — **DeepThink** and
   **Search** — clicked only when the current `aria-pressed` state differs from the requested one, so
   the site's own persistence is respected. DeepThink is requested from the model id, and Search is
