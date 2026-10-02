@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import codecs
 import json
 import re
 import secrets
@@ -55,11 +56,22 @@ RESIZE_WAIT = 2.0                   # seconds to wait for the terminal to honour
 # ===== STREAM TIMING =====
 STREAM_POLL_MS = 80                # how often we pull the XHR buffer out of the page
 STREAM_IDLE_TIMEOUT = 300          # seconds without any new bytes before we call it dead
+COMPLETION_PATH = '/api/v0/chat/completion'   # the endpoint that streams the answer
 # Seconds of silence after which we press the site's "Retry" control once. The
 # site parks it when it gave up loading an answer, and pressing it re-fetches
 # that same answer - it does not restart generation.
 RETRY_AFTER_STALL = 8
 CHAT_URL_READY_TIMEOUT = 45        # seconds to wait for the composer textarea
+
+# Start a new chat on the already-loaded page instead of a full page.goto.
+# DeepSeek mints a new chat_session_id per navigation, so a reload is how we got
+# a clean context; a client-side router transition mints one just as well, and
+# skips re-running the SPA boot, auth check and asset load on every request.
+SPA_CHAT_REUSE = True
+# Reuse keeps the JS heap between requests (a reload is what recycled it), and
+# the heap is what runs away on a ~2.6M character prompt. Above this, take the
+# reload deliberately instead of quietly inheriting a bloated page.
+SPA_HEAP_LIMIT_MB = 900
 IMAGE_UPLOAD_WAIT = 4.0            # seconds to let the site finish uploading attachments
 
 # Persistent token/character counters, shown on the startup screen. Kept next
@@ -393,6 +405,30 @@ COMPOSER_OR_BAN_JS = """
     }
 """
 
+# Put the mirrored buffer back to its just-loaded shape. The shim creates
+# window.__dsx once per window load and only clears it when the site calls
+# XHR.send for the completion - so with the page reused between requests the
+# previous answer is still sitting there (active, done, full text) at the moment
+# the next prompt is typed. Reading that hands the old answer to the client and
+# ends the stream on its terminator, which is the "every request answers with
+# the first one" bug.
+RESET_TAP_JS = """
+    () => {
+        window.__dsx = {
+            active: false, raw: '', body: null, headers: null,
+            status: null, done: false, error: null,
+            responseType: null, started: 0
+        };
+        return true;
+    }
+"""
+
+# What a stream sees before its own request has started: nothing.
+EMPTY_SNAP = {
+    "active": False, "raw": "", "body": None, "headers": None,
+    "status": None, "done": False, "error": None, "responseType": None,
+}
+
 # Read the mirrored XHR buffer. Cheap enough to poll every ~80ms.
 TAP_POLL_JS = """
     () => {
@@ -403,18 +439,6 @@ TAP_POLL_JS = """
             headers: S.headers, status: S.status, done: !!S.done,
             error: S.error, responseType: S.responseType
         };
-    }
-"""
-
-# Last-resort reader if the XHR tap never fires: scrape the rendered answer.
-DOM_ANSWER_JS = """
-    () => {
-        const cands = [...document.querySelectorAll(
-            '[class*="markdown"], [class*="fbb737a4"], [data-message-role="assistant"]'
-        )].filter(e => e.offsetParent);
-        if (!cands.length) return '';
-        const last = cands[cands.length - 1];
-        return (last.innerText || '').trim();
     }
 """
 
@@ -1887,6 +1911,41 @@ FILL_JS = """
     }
 """
 
+# Client-side router transition to a fresh chat, with a sentinel that proves the
+# document was NOT reloaded: a real page load wipes window, so the counter
+# vanishing means we silently paid for a full boot anyway.
+NEW_CHAT_SPA_JS = """
+    () => {
+        window.__spaWarm = (window.__spaWarm || 0) + 1;
+        const token = window.__spaWarm;
+        const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight);
+        const pick = (sel) => {
+            for (const el of document.querySelectorAll(sel)) {
+                const label = (el.getAttribute('aria-label') ||
+                               el.getAttribute('title') || '') + '';
+                if (!vis(el) || /stop|send|close/i.test(label)) continue;
+                return el;
+            }
+            return null;
+        };
+        // The site's own "new chat" control is the cleanest transition, but it
+        // is not guaranteed to exist on every build, so the router is the
+        // fallback: pushState + popstate is what React/Next routers listen for.
+        let clicked = false;
+        for (const sel of ['[data-testid="new-chat-button"]',
+                           'button[aria-label*="New chat" i]',
+                           'div[aria-label*="New chat" i]']) {
+            const el = pick(sel);
+            if (el) { el.click(); clicked = true; break; }
+        }
+        if (!clicked) {
+            history.pushState({}, '', '/');
+            window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+        }
+        return token;
+    }
+"""
+
 # Over the site's character limit the composer shows "Over limit by N%" and
 # submission is dropped. The Send control is a div.ds-button--primary
 # ds-button--filled (not a <button>, and NOT disabled by the limit - the block
@@ -1938,6 +1997,17 @@ class DeepSeekSession:
         # The control appears only once the site swaps the composer out, which
         # can be a moment after we notice the disconnect.
         self._stop_attempts_left = 8
+        # CDP stream reader, filled in by _start_net_reader(). Initialised here
+        # so the snapshot still works if the session or the command is refused.
+        self._cdp = None
+        self._net_urls = {}
+        self._net_seen = set()
+
+        self._net_text = ""
+        # False until the request WE sent has actually reached the wire
+        self._net_armed = False
+        self._warm = False
+        self._net_dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.context = None
         self.lock = asyncio.Lock()
         self.last_activity = 0.0
@@ -1984,6 +2054,7 @@ class DeepSeekSession:
         self.page = await self.context.new_page()
         self.page.on("pageerror", self._on_pageerror)
         self.page.on("response", self._on_response)
+        await self._start_net_reader()
         await self._apply_account(self.current_account)
         await self._open_chat()
         # _open_chat raises unless the page is genuinely signed in, so
@@ -2160,9 +2231,57 @@ class DeepSeekSession:
         except Exception:
             return False
 
+    async def _heap_used_mb(self):
+        """JS heap in MB, or 0.0 when it cannot be read."""
+        try:
+            if self._cdp is None:
+                self._cdp = await self.context.new_cdp_session(self.page)
+            res = await self._cdp.send("Runtime.getHeapUsage")
+            return res.get("usedSize", 0) / (1024 * 1024)
+        except Exception:
+            return 0.0
+
+    async def _spa_new_chat(self):
+        """Start a fresh chat on the already-loaded page.
+
+        Returns False - leaving the caller to do a real page.goto - whenever the
+        page cannot be trusted to still be warm: it reloaded behind our back
+        (sentinel gone), its heap is bloated enough to be worth recycling, or the
+        composer did not come back.
+        """
+        if not SPA_CHAT_REUSE or not self._warm:
+            return False
+        used = await self._heap_used_mb()
+        if used > SPA_HEAP_LIMIT_MB:
+            log(f"[spa] heap {used:.0f}MB > {SPA_HEAP_LIMIT_MB}MB - full reload",
+                level="WARN")
+            self._warm = False
+            return False
+        try:
+            token = await self.page.evaluate(NEW_CHAT_SPA_JS)
+            if not token:
+                return False
+            await asyncio.sleep(0.3)
+            same = await self.page.evaluate(
+                "() => window.__spaWarm === %d" % token)
+        except Exception:
+            self._warm = False
+            return False
+        if not same:
+            log("[spa] new chat reloaded the page - full reload next time",
+                level="WARN")
+            self._warm = False
+            return False
+        if not await self._await_composer():
+            self._warm = False
+            return False
+        return True
+
     async def _open_chat(self):
         """Load a brand-new chat. DeepSeek pre-creates a chat session on every
         page load, so navigating to '/' gives each API call a clean context."""
+        if await self._spa_new_chat():
+            return True
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
         # Known mute: this page is never going to render a composer, so say so
         # now instead of waiting out the timeout and then logging in for nothing.
@@ -2170,6 +2289,7 @@ class DeepSeekSession:
         if muted:
             raise RuntimeError(muted)
         if not await self._on_sign_in_page() and await self._await_composer():
+            self._warm = True
             return True
         # either the composer never showed up, or we are already staring at the
         # sign-in form - go straight for the credentials instead of waiting again
@@ -2177,6 +2297,7 @@ class DeepSeekSession:
             raise RuntimeError("chat.deepseek.com is not signed in and login failed")
         if not await self._await_composer():
             raise RuntimeError(await self._no_composer_reason())
+        self._warm = True
         return True
 
     def _muted_until(self):
@@ -2412,6 +2533,14 @@ class DeepSeekSession:
         its own."""
         self._model_type = None
         await self._open_chat()
+        # neither reader is allowed to speak for this request until the site
+        # opens its completion XHR: clear the network buffer, wipe the mirror
+        # left in the page, and stay disarmed
+        self._net_reset()
+        try:
+            await self.page.evaluate(RESET_TAP_JS)
+        except Exception:
+            pass                       # page mid-navigation; the CDP arming stands
         await self.set_prefs(thinking, search)
         await self.set_model(model_type)
 
@@ -2464,6 +2593,102 @@ class DeepSeekSession:
         except Exception as e:
             yield "error", str(e)
 
+    def _net_reset(self):
+        """Forget the previous answer on both readers.
+
+        Runs before the prompt is typed rather than off an event from the site:
+        the buffer mirrored in the page and the one fed by CDP both outlive a
+        single answer once the page is reused, and no event reliably marks the
+        boundary between two requests.
+        """
+        self._net_text = ""
+        self._net_urls = {}
+        self._net_seen = set()
+        self._net_armed = False
+        dec = getattr(self, "_net_dec", None)
+        if dec is not None:
+            dec.reset()
+
+    async def _start_net_reader(self):
+        """Read the completion off the network rather than out of the page.
+
+        The in-page hook only ever sees XMLHttpRequest. When the site changes
+        transport the hook goes silent and the answer streams past unseen, which
+        is the stall this replaces: CDP reports the body of every request
+        whatever made it, so the reading survives a transport change. It also
+        injects nothing into the page, so there is nothing there to notice, and
+        the bytes arrive as they happen instead of on a poll.
+
+        Kept as a best effort: if the session or the command is refused, the
+        page hook stays the reader and nothing else changes.
+        """
+        self._net_urls = {}
+        self._net_text = ""
+        self._net_dec = codecs.getincrementaldecoder("utf-8")("replace")
+        try:
+            cdp = await self.context.new_cdp_session(self.page)
+        except Exception as e:
+            log(f"[stream] no CDP session, staying on the page hook: {e}", level="WARN")
+            return
+        self._cdp = cdp
+
+        def on_request(ev):
+            url = (ev.get("request") or {}).get("url") or ""
+            rid = ev.get("requestId")
+            ours = COMPLETION_PATH in url
+            self._net_urls[rid] = ours
+            if ours:
+                self._net_armed = True
+            if ours and rid not in self._net_seen:
+                # A new completion request starts a new answer, and the site
+                # replays it from the beginning, so the buffer starts over too.
+                # Without this the next request would hand the client the whole
+                # previous answer before its own first token.
+                self._net_seen.add(rid)
+                if self._net_text:
+                    self._net_text = ""
+                    self._net_dec.reset()
+
+        def on_data(ev):
+            chunk = ev.get("data")
+            if not self._net_urls.get(ev.get("requestId")):
+                return
+            try:
+                # CDP hands the body base64-encoded; anything that is not
+                # decodable is treated as text rather than dropped.
+                raw = base64.b64decode(chunk, validate=False)
+            except Exception:
+                raw = (chunk or "").encode("utf-8", "replace")
+            # decoded through one decoder so a multi-byte character split
+            # across two events does not turn into replacement characters
+            self._net_text += self._net_dec.decode(raw, False)
+
+        cdp.on("Network.requestWillBeSent", on_request)
+        cdp.on("Network.dataReceived", on_data)
+        try:
+            await cdp.send("Network.enable")
+        except Exception as e:
+            log(f"[stream] CDP refused Network.enable, page hook stays: {e}", level="WARN")
+
+    async def _stream_snapshot(self):
+        """What the stream has produced so far: CDP first, page hook second.
+
+        Nothing is reported until OUR request has reached the wire. Until then
+        both readers still hold the previous answer, and the gap between clicking
+        Send and the site opening its XHR is wide enough to be polled - reading
+        that gap replays the old answer and ends the stream on its terminator.
+        """
+        if self._net_text:
+            return {"active": True, "raw": self._net_text, "body": None,
+                    "headers": None, "status": None, "done": False,
+                    "error": None, "responseType": "cdp"}
+        snap = await self.page.evaluate(TAP_POLL_JS)
+        # the shim wipes its own buffer inside XHR.send, so anything non-empty
+        # here belongs to the request we just sent
+        if snap.get("active") and (snap.get("raw") or not snap.get("done")):
+            self._net_armed = True
+        return snap if self._net_armed else dict(EMPTY_SNAP)
+
     async def stream_tokens(self, timeout_s=STREAM_IDLE_TIMEOUT):
         """Poll the mirrored XHR buffer, yield (kind, delta) where kind is
         'thinking' | 'answer' | 'error' | 'done'."""
@@ -2473,7 +2698,6 @@ class DeepSeekSession:
         last_len = 0
         last_growth = time.time()
         started = False
-        dom_mode = False
         retry_clicked = False
         last_retry_try = 0.0
         # last_captcha_check = 0.0
@@ -2482,10 +2706,16 @@ class DeepSeekSession:
             if await self.stop_if_client_gone():
                 return
 
-            snap = await self.page.evaluate(TAP_POLL_JS)
+            snap = await self._stream_snapshot()
             self.last_debug = snap
             raw = snap.get("raw") or ""
 
+            if len(raw) < last_len:
+                # A fresh completion request restarted the buffer (the site
+                # replays the answer from its first byte), so the offsets have
+                # to go back to the start or the loop would wait for the replay
+                # to grow past a position that no longer exists.
+                last_len = consumed = 0
             if len(raw) > last_len:
                 if not started:
                     started = True
@@ -2544,26 +2774,6 @@ class DeepSeekSession:
                             level="WARN")
                 except Exception:
                     pass
-
-            if not started:
-                # the tap stayed silent: responseType we cannot read, or the
-                # site moved transports. Fall back to scraping the answer.
-                if not dom_mode and now - last_growth > 12:
-                    dom_mode = True
-                    log("[stream] XHR tap silent, falling back to DOM scraping",
-                        level="WARN")
-                if dom_mode:
-                    dom = (await self.page.evaluate(DOM_ANSWER_JS)) or ""
-                    if len(dom) > st.sent.get("answer", 0):
-                        got = st._diff("answer", dom)
-                        if got:
-                            yield got
-                        last_growth = time.time()
-                    elif dom and time.time() - last_growth > 3:
-                        yield "done", ""
-                        return
-                    await asyncio.sleep(0.25)
-                    continue
 
             if now - last_growth > timeout_s:
                 yield "error", f"no stream data for {timeout_s}s"
@@ -2941,7 +3151,7 @@ async def chat_completions(request: Request):
                 fail_reason = None
 
                 try:
-                    await wk.send_message(prompt, thinking=thinking,
+                            await wk.send_message(prompt, thinking=thinking,
                                           search=search, model_type=model_type,
                                           images=images)
                 except Exception as e:
