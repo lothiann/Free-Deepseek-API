@@ -634,13 +634,28 @@ STOP_GENERATION_JS = """
 RETRY_BUTTON_JS = """
     () => {
         const visible = (el) => !!(el.offsetWidth || el.offsetHeight);
+        const labelOf = (el) => ((el.textContent || '') + ' ' +
+                                 (el.getAttribute('aria-label') || '')).trim();
         for (const el of document.querySelectorAll('div[role="button"]')) {
-            const label = ((el.textContent || '') + ' ' +
-                           (el.getAttribute('aria-label') || '')).trim();
-            if (/retry|\\u043f\\u043e\\u0432\\u0442\\u043e\\u0440/i.test(label) &&
-                visible(el) && !el.disabled) {
+            const label = labelOf(el);
+            if (/retry|\u043f\u043e\u0432\u0442\u043e\u0440/i.test(label) && visible(el) && !el.disabled) {
                 el.click();
                 return true;
+            }
+        }
+        // A failed request renders an error card whose buttons are bare icons -
+        // no text, no aria-label - so the scan above can never match them. That
+        // card pairs a close control (first) with a regenerate one (last), and
+        // clicking the last re-sends the request, which is what "Retry" means.
+        const ERR = /network error|network request failed|\u7f51\u7edc\u9519\u8bef|\u7f51\u7edc\u5f02\u5e38/i;
+        for (const leaf of document.querySelectorAll('span, div')) {
+            const text = (leaf.textContent || '').trim();
+            if (!text || text.length > 120 || !ERR.test(text)) continue;
+            for (let card = leaf, up = 0; card && up < 6; card = card.parentElement, up++) {
+                const btns = [...card.querySelectorAll('div[role="button"]')]
+                    .filter(visible)
+                    .filter((b) => !/stop/i.test(labelOf(b)));
+                if (btns.length) { btns[btns.length - 1].click(); return true; }
             }
         }
         return false;
@@ -2006,6 +2021,9 @@ class DeepSeekSession:
         self._net_text = ""
         # False until the request WE sent has actually reached the wire
         self._net_armed = False
+        # set when the completion request dies on the network, so the stream
+        # can fail fast instead of sitting out the idle timeout
+        self._net_failed = None
         self._warm = False
         self._net_dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.context = None
@@ -2605,6 +2623,7 @@ class DeepSeekSession:
         self._net_urls = {}
         self._net_seen = set()
         self._net_armed = False
+        self._net_failed = None
         dec = getattr(self, "_net_dec", None)
         if dec is not None:
             dec.reset()
@@ -2663,7 +2682,27 @@ class DeepSeekSession:
             # across two events does not turn into replacement characters
             self._net_text += self._net_dec.decode(raw, False)
 
+        def on_response(ev):
+            rid = ev.get("requestId")
+            if not self._net_urls.get(rid):
+                return
+            status = ((ev.get("response") or {}).get("status")) or 0
+            if status >= 400:
+                self._net_failed = f"upstream {status}"
+
+        def on_failed(ev):
+            rid = ev.get("requestId")
+            if not self._net_urls.get(rid):
+                return
+            # The site shows "Network Error. Please check your network status."
+            # for exactly this: the request never produced a body, so nothing
+            # ever arrives to be parsed and the stream would otherwise idle out.
+            self._net_failed = ("network error: "
+                                + (ev.get("errorText") or "request failed"))
+
         cdp.on("Network.requestWillBeSent", on_request)
+        cdp.on("Network.responseReceived", on_response)
+        cdp.on("Network.loadingFailed", on_failed)
         cdp.on("Network.dataReceived", on_data)
         try:
             await cdp.send("Network.enable")
@@ -2704,6 +2743,10 @@ class DeepSeekSession:
 
         while True:
             if await self.stop_if_client_gone():
+                return
+
+            if self._net_failed:
+                yield "error", self._net_failed
                 return
 
             snap = await self._stream_snapshot()
