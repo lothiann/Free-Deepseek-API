@@ -73,6 +73,7 @@ SPA_CHAT_REUSE = True
 # reload deliberately instead of quietly inheriting a bloated page.
 SPA_HEAP_LIMIT_MB = 900
 IMAGE_UPLOAD_WAIT = 4.0            # seconds to let the site finish uploading attachments
+IMAGE_UPLOAD_RETRIES = 3         # clicks on a failed thumbnail before we give up
 
 # Persistent token/character counters, shown on the startup screen. Kept next
 # to the script (not in CWD) so the numbers follow it wherever it is run from.
@@ -1926,6 +1927,31 @@ FILL_JS = """
     }
 """
 
+# Ask whether any attachment is sitting in a failed state, and with retry=true
+# click the failed thumbnail to have the site upload it again.
+#
+# The failed chip is the thumbnail wrapper itself (role="button"), holding the
+# preview, the spinner and the "Upload failed" label; the little x next to it is
+# a separate tabindex=0 div with no role, so asking for the closest [role=button]
+# lands on the retry affordance and never on the remove control. Only the
+# failure is inspected: success has no reliable marker (the preview URL changes
+# between blob: and a CDN host), so a quiet composer is taken as done - which is
+# exactly how this worked before.
+UPLOAD_STATE_JS = """
+    (retry) => {
+        const ERR = /upload failed|upload error|failed to upload|\u4e0a\u4f20\u5931\u8d25/i;
+        for (const el of document.querySelectorAll('div, span')) {
+            const text = (el.textContent || '').trim();
+            if (!text || text.length > 80 || !ERR.test(text)) continue;
+            if (!retry) return true;
+            const host = el.closest('[role="button"]');
+            if (host) { host.click(); return true; }
+            return false;
+        }
+        return false;
+    }
+"""
+
 # Client-side router transition to a fresh chat, with a sentinel that proves the
 # document was NOT reloaded: a real page load wipes window, so the counter
 # vanishing means we silently paid for a full boot anyway.
@@ -2537,6 +2563,21 @@ class DeepSeekSession:
             await self.page.locator("input[type=file]").first.set_input_files(paths)
             # the site uploads asynchronously; ref_file_ids lands in the payload
             await asyncio.sleep(IMAGE_UPLOAD_WAIT)
+            # A failed upload used to pass silently: the request went out without
+            # ref_file_ids and the model answered blind to the picture. Retry the
+            # chip in place - re-supplying the input would only add a second
+            # thumbnail - and if it stays broken, fail the request so the
+            # request-level retry redoes the whole attach on a fresh chat.
+            for attempt in range(IMAGE_UPLOAD_RETRIES + 1):
+                failed = await self.page.evaluate(UPLOAD_STATE_JS, False)
+                if not failed:
+                    break
+                if attempt == IMAGE_UPLOAD_RETRIES:
+                    raise RuntimeError("image upload failed on the site")
+                log(f"[upload] site reported a failed upload - retrying "
+                    f"{attempt + 1}/{IMAGE_UPLOAD_RETRIES}", level="WARN")
+                await self.page.evaluate(UPLOAD_STATE_JS, True)
+                await asyncio.sleep(IMAGE_UPLOAD_WAIT)
         finally:
             for p_ in paths:
                 try:
