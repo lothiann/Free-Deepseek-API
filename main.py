@@ -62,6 +62,7 @@ COMPLETION_PATH = '/api/v0/chat/completion'   # the endpoint that streams the an
 # that same answer - it does not restart generation.
 RETRY_AFTER_STALL = 8
 CHAT_URL_READY_TIMEOUT = 45        # seconds to wait for the composer textarea
+BAN_NOTICE_TIMEOUT = 6             # seconds to wait for the suspension banner to mount
 
 # Start a new chat on the already-loaded page instead of a full page.goto.
 # DeepSeek mints a new chat_session_id per navigation, so a reload is how we got
@@ -1637,6 +1638,10 @@ def build_prompt(messages, tools=None):
 FINISH_STATES = {"FINISHED", "COMPLETED", "SUCCESS", "DONE",
                  "finished", "completed", "success", "done"}
 
+# The site's "still working" marker. It is not a failure: generation continues
+# after it, so it must never be relayed to the client as an error.
+IN_PROGRESS_STATES = {"WIP", "wip"}
+
 # fragment.type -> which channel its text belongs to
 FRAGMENT_KINDS = {
     "RESPONSE": "answer",
@@ -1697,6 +1702,13 @@ class StreamState:
                     self.status = v
                 else:
                     self.quasi_status = v
+                if (v and v not in FINISH_STATES and v not in IN_PROGRESS_STATES
+                        and not self.error):
+                    # Not a success word and not an in-flight marker, so it is
+                    # the failure the site is reporting. Relay it exactly as it
+                    # came - no list of known failures to keep in sync, the value
+                    # is the site's and it must reach the retry path unchanged.
+                    self.error = v
         for key in ("model_type", "modelType"):
             v = obj.get(key)
             if isinstance(v, str) and v:
@@ -2373,7 +2385,18 @@ class DeepSeekSession:
         # token" for an account that was suspended all along.
         muted = self._mute_reason()
         if muted:
-            log(f"[auth] not signed in - {muted}", level="ERROR")
+            # A muted chat is not a session problem: the token is refreshed and
+            # saved by _browser_login, so the account IS signed in and the chat
+            # is what cannot be used. Saying "not signed in" sent the reader
+            # hunting a token bug that does not exist.
+            try:
+                token_ok = bool(await self.page.evaluate(SESSION_TOKEN_JS))
+            except Exception:
+                token_ok = False
+            if token_ok:
+                log(f"[auth] signed in, but {muted}", level="ERROR")
+            else:
+                log(f"[auth] not signed in - {muted}", level="ERROR")
             return False
         acc = self.current_account
         if not AUTO_REFRESH:
@@ -2496,10 +2519,14 @@ class DeepSeekSession:
         if await self._spa_new_chat():
             return True
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-        # Known mute: this page is never going to render a composer, so say so
-        # now instead of waiting out the timeout and then logging in for nothing.
+        # Known mute: no composer is coming, so do not wait out the timeout and
+        # then log in for nothing. The suspension banner is normally mounted by
+        # now, so it is read first and the real reason is reported right here
+        # instead of ~45s later on some unrelated path.
         muted = self._mute_reason()
         if muted:
+            if await self._probe_ban():
+                raise RuntimeError("account suspended")
             raise RuntimeError(muted)
         if not await self._on_sign_in_page() and await self._await_composer():
             self._warm = True
@@ -2532,19 +2559,24 @@ class DeepSeekSession:
         return (f"account #{self.account_idx} ({self._label(self.account_idx)}) chat is "
                 f"muted until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}")
 
-    async def _no_composer_reason(self):
-        """Explain a missing composer. A suspended account renders a notice
-        instead of the chat UI, and no amount of logging in will fix that."""
+    async def _note_suspension(self):
+        """Read the ban notice off the page and print it once.
+
+        Returns the site's own wording, or '' when the banner is not rendered.
+        A suspended account replaces the chat UI with a ds-alert, so the notice
+        only exists once the SPA has rendered the chat route. Every caller used
+        to short-circuit on the already-known mute before looking at the page
+        at all, which is why the real reason surfaced ~45s late on some
+        unrelated path.
+        """
         try:
             suspended = await self.page.evaluate(SUSPENDED_JS)
         except Exception:
             suspended = ''
-        # The mute is already reported by _note_mute, which reads the API and
-        # fires long before this page renders its banner. The site's own wording
-        # is printed once, as extra detail - printing it again on every reload
-        # is what made the log look like two unrelated events minutes apart.
-        already_known = bool(self._mute_reason()) and self._ban_announced
-        if suspended and not already_known:
+        if not suspended:
+            return ''
+        self._last_ban = suspended
+        if not self._ban_announced:
             # The site states the ban in its own words, so all of it is printed -
             # one line, same [ERROR] shape as every other line, and fully red
             # (log() colours only the level tag, so this prints by hand).
@@ -2559,17 +2591,54 @@ class DeepSeekSession:
                     f.write(f"[{ts}] [ERROR] {msg}\n")
             except Exception:
                 log(f"[account #{self.account_idx}] SUSPENDED: {suspended}", level="ERROR")
-            self._last_ban = suspended
             self._ban_announced = True
+        return suspended
+
+    async def _probe_ban(self, timeout_s=BAN_NOTICE_TIMEOUT):
+        """Wait briefly for the suspension banner to mount and record it.
+
+        The muted shortcut raised before anything inspected the page, so the
+        precise reason only turned up much later, after an unrelated login
+        attempt had finally landed on the chat route. This looks first.
+        """
+        deadline = time.time() + timeout_s
+        while True:
+            state = await poll_js(self.page, COMPOSER_OR_BAN_JS, timeout_s=0.5)
+            if state == "ban":
+                return await self._note_suspension()
+            # a composer, or the sign-in wall, means there is no banner to wait for
+            if state == "ready" or await self._on_sign_in_page():
+                return ''
+            if time.time() >= deadline:
+                return ''
+
+    async def _no_composer_reason(self):
+        """Explain a missing composer. A suspended account renders a notice
+        instead of the chat UI, and no amount of logging in will fix that."""
+        suspended = await self._note_suspension()
+        # The banner is printed once, in full, by _note_suspension. This reason
+        # is handed to the retry path, so repeating the whole notice here is
+        # what produced two identical SUSPENDED lines a millisecond apart.
         if self._last_ban or self._mute_reason():
-            # The banner above already printed the site's wording in full and
-            # only once. This reason is handed to the retry path and logged by
-            # the caller, so repeating the whole notice is what produced two
-            # identical SUSPENDED lines a millisecond apart.
             return "account suspended" if suspended else self._mute_reason()
         return "chat.deepseek.com never rendered the composer"
 
     # ---------------- rotation / retry ----------------
+    @staticmethod
+    def _dead_account(worker, fail_reason):
+        """True when retrying this same account cannot possibly help.
+
+        A suspension is permanent, and a mute we already know about is a fact
+        the site will not change on reload. Both used to fall through to the
+        generic retry branch, which reloaded the same dead account four times
+        before giving up - the mute one had no "account suspended" substring
+        and no _last_ban yet, so nothing marked it as terminal.
+        """
+        why = fail_reason or ""
+        return bool(getattr(worker, "_last_ban", "")
+                    or "account suspended" in why
+                    or "chat is muted" in why)
+
     def pick_next_usable(self, start):
         """Index of the next usable account after `start`, skipping the ones
         whose chat mute has not expired yet.
@@ -3459,6 +3528,11 @@ async def chat_completions(request: Request):
         wk.client_gone = client_gone      # poll loop watches this for a hangup
         wk._stop_attempts_left = 8
         try:
+            if client_gone.is_set():
+                # Client hung up while the browser was still starting. Nothing
+                # has gone on the wire, so skip prepare and the prompt; the
+                # outer finally hands the worker back like any finished request.
+                return
             try:
                 await wk.rate_limit()
                 await wk.before_request()
@@ -3482,6 +3556,13 @@ async def chat_completions(request: Request):
                 tool_call_index = 0
                 answer_started = False
                 fail_reason = None
+
+                if client_gone.is_set():
+                    # The client hung up before this attempt put anything on
+                    # the wire: there is nothing to generate and nothing to
+                    # stop, and the prompt must not be sent. Returning lets the
+                    # outer finally release the worker.
+                    return
 
                 try:
                             await wk.send_message(prompt, thinking=thinking,
@@ -3579,7 +3660,7 @@ async def chat_completions(request: Request):
                     log(f"[request] {why} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
                     # A suspended account never recovers on reload, so spend the
                     # retry on the next one instead of the same dead account.
-                    if getattr(wk, "_last_ban", "") and len(wk.accounts) > 1:
+                    if self._dead_account(wk, fail_reason) and len(wk.accounts) > 1:
                         wk._last_ban = ''
                         nxt = wk.pick_next_usable(wk.account_idx)
                         if nxt is None:
@@ -3734,7 +3815,7 @@ async def chat_completions(request: Request):
                 log(f"[request] {why} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
                 # A suspended account never recovers on reload, so spend the
                 # retry on the next one instead of the same dead account.
-                if getattr(wk, "_last_ban", "") and len(wk.accounts) > 1:
+                if self._dead_account(wk, fail_reason) and len(wk.accounts) > 1:
                     wk._last_ban = ''
                     nxt = wk.pick_next_usable(wk.account_idx)
                     if nxt is None:
