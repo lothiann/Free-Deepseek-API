@@ -72,8 +72,34 @@ SPA_CHAT_REUSE = True
 # the heap is what runs away on a ~2.6M character prompt. Above this, take the
 # reload deliberately instead of quietly inheriting a bloated page.
 SPA_HEAP_LIMIT_MB = 900
-IMAGE_UPLOAD_WAIT = 4.0            # seconds to let the site finish uploading attachments
-IMAGE_UPLOAD_RETRIES = 3         # clicks on a failed thumbnail before we give up
+
+# Rotation budget shared by every worker. It used to live on the session, which
+# meant each browser spent its own rotate_every requests on the same account -
+# the budget was silently multiplied by the pool size, and every worker logged
+# its own "(1/2)". One counter for the whole pool is what the setting was always
+# understood to mean.
+_requests_since_rotation = 0
+
+
+def rotation_count():
+    return _requests_since_rotation
+
+
+def set_rotation_count(value):
+    global _requests_since_rotation
+    _requests_since_rotation = int(value)
+# The site uploads asynchronously and says nothing in the composer when it is
+# done (measured: a chip that uploaded fine keeps its spinner, its blob: preview
+# and its empty label, for 10s+). So the wait is on the site's own answer to the
+# upload - POST to this path came back 200 in 0.87s on a measured 180-byte file -
+# and the numbers below are a ceiling, not a pause: a fast upload returns at
+# once, a slow one waits instead of being cut off. The old fixed 4s sleep was
+# both longer than a real upload and shorter than the site's full pipeline
+# (upload_file, then fetch_files, then the CDN fetch), so it guaranteed nothing.
+UPLOAD_PATH = "/api/v0/file/upload_file"
+UPLOAD_TIMEOUT = 30.0            # ceiling for the site to accept the files
+UPLOAD_POLL_MS = 200
+IMAGE_UPLOAD_RETRIES = 3         # re-uploads of the failed files before we give up
 
 # Persistent token/character counters, shown on the startup screen. Kept next
 # to the script (not in CWD) so the numbers follow it wherever it is run from.
@@ -1142,16 +1168,58 @@ async def poll_js(page, expr, arg=None, timeout_s=10, poll_ms=100):
     return None
 
 
-def save_accounts(accounts, rotate_every=None):
+# One login changes two things at once: the refreshed token, and - from the
+# site's /api/v0/users/current response - a chat mute we had not seen before.
+# Both callers wrote the whole file on the spot, so the log showed two saves
+# three milliseconds apart with nothing in between, which reads like a race and
+# is not one. Writes are coalesced over a short window instead: one write and
+# one log line per burst, carrying every change made in it.
+SAVE_DEBOUNCE = 0.25
+_save_task = None
+_save_blob = None
+_save_count = 0
+
+
+def _save_accounts_now(blob, count):
     try:
-        data = {"rotate_every": int(rotate_every if rotate_every is not None else 10), "accounts": accounts}
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log(f"[accounts] saved {len(accounts)} account(s) to {ACCOUNTS_FILE}")
-        return True
+            f.write(blob)
+        log(f"[accounts] saved {count} account(s) to {ACCOUNTS_FILE}")
+    except Exception as e:
+        log(f"[accounts] failed to save: {e}", level="ERROR")
+
+
+async def _save_accounts_soon():
+    global _save_task, _save_blob, _save_count
+    await asyncio.sleep(SAVE_DEBOUNCE)
+    _save_task = None
+    blob, count, _save_blob, _save_count = _save_blob, _save_count, None, 0
+    if blob is not None:
+        _save_accounts_now(blob, count)
+
+
+def save_accounts(accounts, rotate_every=None):
+    """Record the accounts file, writing once for a burst of changes."""
+    global _save_task, _save_blob, _save_count
+    try:
+        data = {"rotate_every": int(rotate_every if rotate_every is not None else 10),
+                "accounts": accounts}
+        _save_blob = json.dumps(data, ensure_ascii=False, indent=2)
+        _save_count = len(accounts)
     except Exception as e:
         log(f"[accounts] failed to save: {e}", level="ERROR")
         return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # no loop (startup, or a synchronous caller): write straight away
+        blob, count = _save_blob, _save_count
+        globals()["_save_blob"], globals()["_save_count"] = None, 0
+        _save_accounts_now(blob, count)
+        return True
+    if _save_task is None:
+        _save_task = loop.create_task(_save_accounts_soon())
+    return True
 
 
 def mute_left(acc):
@@ -1927,63 +1995,138 @@ FILL_JS = """
     }
 """
 
-# Ask whether any attachment is sitting in a failed state, and with retry=true
-# click the failed thumbnail to have the site upload it again.
+# Is any attachment sitting in a failed state?
 #
-# The failed chip is the thumbnail wrapper itself (role="button"), holding the
-# preview, the spinner and the "Upload failed" label; the little x next to it is
-# a separate tabindex=0 div with no role, so asking for the closest [role=button]
-# lands on the retry affordance and never on the remove control. Only the
-# failure is inspected: success has no reliable marker (the preview URL changes
-# between blob: and a CDN host), so a quiet composer is taken as done - which is
-# exactly how this worked before.
-UPLOAD_STATE_JS = """
-    (retry) => {
+# Only the failure is inspected, and that is not laziness: a chip that uploaded
+# fine looks exactly like one still in flight. Measured on a live page over 10s
+# after a successful 180-byte upload - the spinner stayed visible, the preview
+# stayed on its blob: URL and the label stayed empty, so there is no DOM marker
+# of "done" to wait for. Success is therefore taken from the site's own answer to
+# the upload (see UPLOAD_PATH), and this is the second opinion that catches a
+# refusal the network never showed up for.
+UPLOAD_FAILED_JS = """
+    () => {
         const ERR = /upload failed|upload error|failed to upload|\u4e0a\u4f20\u5931\u8d25/i;
         for (const el of document.querySelectorAll('div, span')) {
             const text = (el.textContent || '').trim();
             if (!text || text.length > 80 || !ERR.test(text)) continue;
-            if (!retry) return true;
-            const host = el.closest('[role="button"]');
-            if (host) { host.click(); return true; }
-            return false;
+            if (el.closest('[role="button"]')) return true;
         }
         return false;
     }
 """
 
-# Client-side router transition to a fresh chat, with a sentinel that proves the
-# document was NOT reloaded: a real page load wipes window, so the counter
-# vanishing means we silently paid for a full boot anyway.
+# Remove exactly the chips that failed, and report how many went.
+#
+# Retrying through the chip's own refresh arrow was tried and abandoned: it is an
+# affordance found by DOM shape, it cannot be relied on to exist, and when it
+# does exist it is indistinguishable from a dead control - so the code kept
+# pressing it instead of retrying anything. Taking the broken chip out and handing
+# the files to the input again uses the one path already known to work.
+#
+# A chip is the role="button" holding the preview; its remove control is the
+# separate icon-only div[tabindex="0"] with no role inside it (the chip itself
+# carries a tabindex too, which is why it is excluded by role, not by position).
+# Chips that uploaded fine are left alone: a request can carry several images and
+# only some of them may have failed.
+REMOVE_FAILED_UPLOADS_JS = """
+    () => {
+        const ERR = /upload failed|upload error|failed to upload|\u4e0a\u4f20\u5931\u8d25/i;
+        const chips = new Set();
+        for (const el of document.querySelectorAll('div, span')) {
+            const text = (el.textContent || '').trim();
+            if (!text || text.length > 80 || !ERR.test(text)) continue;
+            const chip = el.closest('[role="button"]');
+            if (chip) chips.add(chip);
+        }
+        let removed = 0;
+        for (const chip of chips) {
+            const x = chip.querySelector('[aria-label*="remove" i]')
+                   || chip.querySelector('[aria-label*="close" i]')
+                   || [...chip.querySelectorAll('div[tabindex="0"]')].find(
+                        (d) => d.getAttribute('role') !== 'button' &&
+                               d.querySelector('svg'));
+            if (!x) continue;
+            x.click();
+            removed++;
+        }
+        return removed;
+    }
+"""
+
+# Drop every attachment chip still sitting in the composer, and report how many
+# went away.
+#
+# With the page reused between requests a fresh chat is no longer a fresh
+# composer, so chips from a previous request survive: a request without images
+# would then carry their ref_file_ids (the model answers the new question looking
+# at the old picture), and one with images would send both sets. Our own files
+# are attached after this runs, so anything present here is a leftover by
+# definition and clearing it unconditionally is the correct reading.
+#
+# A chip is the wrapper holding the preview - a role="button" with an <img> in
+# it. Its remove control is the little x: a separate icon-only div[tabindex="0"]
+# inside the chip, distinct from the wrapper, which is why the wrapper's own
+# tabindex must be excluded or the click would land on the thumbnail (the retry
+# affordance) instead of the x.
+CLEAR_ATTACHMENTS_JS = """
+    () => {
+        let removed = 0;
+        for (let guard = 0; guard < 40; guard++) {
+            const chips = [...document.querySelectorAll('[role="button"]')]
+                .filter((b) => b.querySelector('img'));
+            if (!chips.length) break;
+            let clicked = false;
+            for (const chip of chips) {
+                if (!chip.offsetWidth && !chip.offsetHeight) continue;
+                const x = chip.querySelector('[aria-label*="remove" i]')
+                       || chip.querySelector('[aria-label*="close" i]')
+                       || [...chip.querySelectorAll('div[tabindex="0"]')]
+                            .find((d) => d !== chip && d.querySelector('svg'));
+                if (!x) continue;
+                x.click();
+                clicked = true;
+                removed++;
+                break;
+            }
+            if (!clicked) break;
+        }
+        return removed;
+    }
+"""
+
+# Start a fresh chat with the site's own control, and prove the document was NOT
+# reloaded while doing it: a real page load wipes window, so a vanished sentinel
+# means we silently paid for a full boot anyway.
+#
+# How the control is found, and why not by id or class: on the live page it has
+# no id, no aria-label and no data-testid at all - the four selectors this used to
+# try (data-testid="new-chat-button", [aria-label*="New chat"], ...) matched
+# nothing, every one of them returning zero elements. What it does have is the
+# label text, inside
+#     div._7b40dad > div.dc1f7bee._4bcc731 > div._5a8ac7a.a084f19e[tabindex=0]
+#         <div class="ds-icon">+svg</div><span>New chat</span>
+# and that text is the localisation key chatInputNewChatButton, so it survives a
+# class-hash change while a hashed selector would not. The click target is the
+# tabindex div that carries the label, which is the element the site's own
+# onClick is bound to.
+#
+# The router fallback is gone on purpose. Rewriting the address by hand moved the
+# URL back to "/" while leaving the previous conversation on screen, so the
+# sentinel survived and the transition looked like it had worked while the old
+# turns stayed in the context of every later request. If the control is not
+# there, this returns nothing and the caller does a real navigation instead.
 NEW_CHAT_SPA_JS = """
     () => {
         window.__spaWarm = (window.__spaWarm || 0) + 1;
-        const token = window.__spaWarm;
-        const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight);
-        const pick = (sel) => {
-            for (const el of document.querySelectorAll(sel)) {
-                const label = (el.getAttribute('aria-label') ||
-                               el.getAttribute('title') || '') + '';
-                if (!vis(el) || /stop|send|close/i.test(label)) continue;
-                return el;
-            }
-            return null;
-        };
-        // The site's own "new chat" control is the cleanest transition, but it
-        // is not guaranteed to exist on every build, so the router is the
-        // fallback: pushState + popstate is what React/Next routers listen for.
-        let clicked = false;
-        for (const sel of ['[data-testid="new-chat-button"]',
-                           'button[aria-label*="New chat" i]',
-                           'div[aria-label*="New chat" i]']) {
-            const el = pick(sel);
-            if (el) { el.click(); clicked = true; break; }
-        }
-        if (!clicked) {
-            history.pushState({}, '', '/');
-            window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
-        }
-        return token;
+        const vis = (el) => !!(el.offsetWidth || el.offsetHeight);
+        const label = (el) => (el.innerText || el.textContent || '').trim();
+        // the control, or any ancestor of its label that is still clickable
+        const target = [...document.querySelectorAll('div[tabindex="0"]')]
+            .find((el) => vis(el) && /^new chat$/i.test(label(el)));
+        if (!target) return null;
+        target.click();
+        return window.__spaWarm;
     }
 """
 
@@ -2050,6 +2193,13 @@ class DeepSeekSession:
         # set when the completion request dies on the network, so the stream
         # can fail fast instead of sitting out the idle timeout
         self._net_failed = None
+        # uploads: how many files the site has accepted since the last reset,
+        # and which requestId to blame if one dies on the network
+        self._upload_ok = 0
+        self._upload_rid = None
+        # set when the site refuses the session outright: the token is dead, and
+        # no amount of retrying on it will help
+        self._needs_login = False
         self._warm = False
         self._net_dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.context = None
@@ -2070,7 +2220,6 @@ class DeepSeekSession:
         self.rotate_every = rotate_every if rotate_every is not None else 10
         # the pool deals these out round-robin, see WorkerPool._next_start_index
         self.account_idx = start_idx
-        self.requests_on_account = 0
 
     @property
     def current_account(self):
@@ -2186,7 +2335,6 @@ class DeepSeekSession:
         if not (email and password):
             log("[auth] account has no email/password - cannot log in", level="ERROR")
             return ""
-        log(f"[auth] signing in as {email}")
         try:
             await self.page.goto(SIGN_IN_URL, wait_until="domcontentloaded", timeout=90000)
             if not await poll_js(self.page, LOGIN_FORM_READY_JS, timeout_s=30):
@@ -2231,7 +2379,8 @@ class DeepSeekSession:
         if not AUTO_REFRESH:
             log("[auth] not signed in and 'Auto Refresh Tokens' is OFF", level="ERROR")
             return False
-        log("[auth] not signed in (stale token?) - logging in", level="WARN")
+        log(f"[auth] stale token - signing in as "
+            f"{acc.get('name') or acc.get('email')}", level="WARN")
         async with _auth_lock():
             # another worker may have rotated the shared token while we waited
             await self._apply_account(acc)
@@ -2255,13 +2404,26 @@ class DeepSeekSession:
         return await self._is_authenticated()
 
     async def _await_composer(self):
-        """Wait for the composer, but bail out the moment the site says this
-        account is suspended. Returns True when the composer is there."""
-        state = await poll_js(self.page, COMPOSER_OR_BAN_JS,
-                              timeout_s=CHAT_URL_READY_TIMEOUT)
-        if state == "ban":
-            raise RuntimeError(await self._no_composer_reason())
-        return state == "ready"
+        """Wait for the composer, stopping early for a ban or for the sign-in
+        wall. Returns True when the composer is there.
+
+        The sign-in page renders no textarea at all, so the composer probe
+        reports nothing until it times out - and it timed out after the full
+        CHAT_URL_READY_TIMEOUT (45s) on a page whose URL had said /sign_in the
+        whole time. The URL is the cheapest possible evidence, so it is checked
+        between polls and the wait ends at once.
+        """
+        deadline = time.time() + CHAT_URL_READY_TIMEOUT
+        while True:
+            state = await poll_js(self.page, COMPOSER_OR_BAN_JS, timeout_s=0.5)
+            if state == "ban":
+                raise RuntimeError(await self._no_composer_reason())
+            if state == "ready":
+                return True
+            if await self._on_sign_in_page():
+                return False
+            if time.time() >= deadline:
+                return False
 
     async def _on_sign_in_page(self):
         """True when the site bounced us to the sign-in form.
@@ -2294,6 +2456,13 @@ class DeepSeekSession:
         composer did not come back.
         """
         if not SPA_CHAT_REUSE or not self._warm:
+            return False
+        if self._needs_login:
+            # the site already refused this session, and a warm page keeps
+            # showing its composer regardless - fall through to the branch that
+            # navigates and logs in again
+            self._needs_login = False
+            self._warm = False
             return False
         used = await self._heap_used_mb()
         if used > SPA_HEAP_LIMIT_MB:
@@ -2338,7 +2507,11 @@ class DeepSeekSession:
         # either the composer never showed up, or we are already staring at the
         # sign-in form - go straight for the credentials instead of waiting again
         if not await self._ensure_signed_in():
-            raise RuntimeError("chat.deepseek.com is not signed in and login failed")
+            # A login can succeed and still leave no composer when the account
+            # is suspended - the credentials are fine, the chat is not. Saying
+            # "not signed in" there sent the reader hunting for a token problem
+            # while the ban was printed right above it.
+            raise RuntimeError(await self._no_composer_reason())
         if not await self._await_composer():
             raise RuntimeError(await self._no_composer_reason())
         self._warm = True
@@ -2389,7 +2562,11 @@ class DeepSeekSession:
             self._last_ban = suspended
             self._ban_announced = True
         if self._last_ban or self._mute_reason():
-            return (f"account suspended: {suspended}") if suspended else self._mute_reason()
+            # The banner above already printed the site's wording in full and
+            # only once. This reason is handed to the retry path and logged by
+            # the caller, so repeating the whole notice is what produced two
+            # identical SUSPENDED lines a millisecond apart.
+            return "account suspended" if suspended else self._mute_reason()
         return "chat.deepseek.com never rendered the composer"
 
     # ---------------- rotation / retry ----------------
@@ -2410,7 +2587,7 @@ class DeepSeekSession:
         log(f"[rotate] -> account #{idx} ({self._label(idx)})")
         await self._wipe()
         self.account_idx = idx
-        self.requests_on_account = 0
+        set_rotation_count(0)
         self._ban_announced = False
         self._model_type = None
         await self._apply_account(self.current_account)
@@ -2466,7 +2643,7 @@ class DeepSeekSession:
         moved the request to the next account."""
         acc = self.current_account
         log(f"[account] serving via '{acc.get('name') or acc.get('email')}' "
-            f"({self.requests_on_account}/{self.rotate_every})")
+            f"({rotation_count()}/{self.rotate_every})")
 
     async def before_request(self):
         """Called inside the lock: rotate if this account has had its turn."""
@@ -2476,14 +2653,14 @@ class DeepSeekSession:
             nxt = self.pick_next_usable(self.account_idx)
             if nxt is not None:
                 await self.switch_account(nxt)
-        if ACCOUNT_ROTATE and self.requests_on_account >= self.rotate_every:
+        if ACCOUNT_ROTATE and rotation_count() >= self.rotate_every:
             if len(self.accounts) > 1:
                 nxt = self.pick_next_usable(self.account_idx)
                 if nxt is not None:
                     await self.switch_account(nxt)
             else:
-                self.requests_on_account = 0
-        self.requests_on_account += 1
+                set_rotation_count(0)
+        set_rotation_count(rotation_count() + 1)
         return self.current_account
 
     async def rate_limit(self):
@@ -2542,6 +2719,30 @@ class DeepSeekSession:
             return False
 
     # ---------------- send / stream ----------------
+    async def _settle_uploads(self, count):
+        """Wait until the site has accepted `count` files, or has refused them.
+
+        The evidence is the site's own answer; a chip that succeeded looks
+        exactly like one still in flight, so there is nothing in the composer to
+        wait on. Returns "done", "failed" or "timeout".
+        """
+        if self._cdp is None:
+            # no network feed: the failure text is all there is, and only after a
+            # grace period long enough for the upload to have started
+            await asyncio.sleep(1.0)
+            return "failed" if await self.page.evaluate(UPLOAD_FAILED_JS) else "done"
+        deadline = time.time() + UPLOAD_TIMEOUT
+        while True:
+            if self._upload_ok >= count:
+                return "done"
+            if self._upload_ok < 0:
+                return "failed"
+            if await self.page.evaluate(UPLOAD_FAILED_JS):
+                return "failed"
+            if time.time() >= deadline:
+                return "timeout"
+            await asyncio.sleep(UPLOAD_POLL_MS / 1000)
+
     async def _attach_images(self, images):
         """Hand image files to the site's own file input.
 
@@ -2560,24 +2761,33 @@ class DeepSeekSession:
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(blob["data"])
                 paths.append(path)
-            await self.page.locator("input[type=file]").first.set_input_files(paths)
-            # the site uploads asynchronously; ref_file_ids lands in the payload
-            await asyncio.sleep(IMAGE_UPLOAD_WAIT)
             # A failed upload used to pass silently: the request went out without
-            # ref_file_ids and the model answered blind to the picture. Retry the
-            # chip in place - re-supplying the input would only add a second
-            # thumbnail - and if it stays broken, fail the request so the
+            # ref_file_ids and the model answered blind to the picture.
+            #
+            # Each round hands the files over and waits for the site to confirm
+            # them, instead of sleeping a fixed four seconds that was both longer
+            # than a real upload and shorter than the site's full pipeline. On
+            # failure the broken chips are removed and the same files are handed
+            # over again; if that stays broken the request fails so the
             # request-level retry redoes the whole attach on a fresh chat.
+            upload = self.page.locator("input[type=file]").first
             for attempt in range(IMAGE_UPLOAD_RETRIES + 1):
-                failed = await self.page.evaluate(UPLOAD_STATE_JS, False)
-                if not failed:
+                self._upload_ok = 0
+                await upload.set_input_files(paths)
+                if await self._settle_uploads(len(paths)) == "done":
                     break
                 if attempt == IMAGE_UPLOAD_RETRIES:
                     raise RuntimeError("image upload failed on the site")
-                log(f"[upload] site reported a failed upload - retrying "
-                    f"{attempt + 1}/{IMAGE_UPLOAD_RETRIES}", level="WARN")
-                await self.page.evaluate(UPLOAD_STATE_JS, True)
-                await asyncio.sleep(IMAGE_UPLOAD_WAIT)
+                removed = await self.page.evaluate(REMOVE_FAILED_UPLOADS_JS)
+                if not removed:
+                    # nothing removable: re-supplying would leave the failed chip
+                    # next to a fresh one, so fail and retry on a clean chat
+                    log("[upload] site refused the file and its chip could not "
+                        "be removed", level="ERROR")
+                    raise RuntimeError("image upload failed on the site")
+                log(f"[upload] site did not take the file - removed {removed} "
+                    f"chip(s), re-uploading {attempt + 1}/{IMAGE_UPLOAD_RETRIES}",
+                    level="WARN")
         finally:
             for p_ in paths:
                 try:
@@ -2592,6 +2802,15 @@ class DeepSeekSession:
         its own."""
         self._model_type = None
         await self._open_chat()
+        # the chat is open and our own files are not attached yet, so every chip
+        # still in the composer belongs to an earlier request
+        try:
+            leftover = await self.page.evaluate(CLEAR_ATTACHMENTS_JS)
+        except Exception:
+            leftover = 0
+        if leftover:
+            log(f"[attach] cleared {leftover} attachment(s) left over from an "
+                f"earlier request", level="WARN")
         # neither reader is allowed to speak for this request until the site
         # opens its completion XHR: clear the network buffer, wipe the mirror
         # left in the page, and stay disarmed
@@ -2697,6 +2916,8 @@ class DeepSeekSession:
             rid = ev.get("requestId")
             ours = COMPLETION_PATH in url
             self._net_urls[rid] = ours
+            if UPLOAD_PATH in url:
+                self._upload_rid = rid
             if ours:
                 self._net_armed = True
             if ours and rid not in self._net_seen:
@@ -2724,15 +2945,34 @@ class DeepSeekSession:
             self._net_text += self._net_dec.decode(raw, False)
 
         def on_response(ev):
+            resp = ev.get("response") or {}
+            url = resp.get("url") or ""
+            status = resp.get("status") or 0
+            if UPLOAD_PATH in url:
+                if 200 <= status < 300:
+                    # the site took the file - this, not the chip's spinner, is
+                    # what "uploaded" actually means
+                    self._upload_ok += 1
+                else:
+                    # a refusal is an answer too: without this the wait sits out
+                    # the whole ceiling on a plain 500 and then complains that
+                    # there was no chip to remove
+                    self._upload_ok = -1
             rid = ev.get("requestId")
             if not self._net_urls.get(rid):
                 return
-            status = ((ev.get("response") or {}).get("status")) or 0
+            if status in (401, 403):
+                # the session is gone: retrying this account cannot work, and on
+                # a warm page nothing else would ever notice
+                self._needs_login = True
             if status >= 400:
                 self._net_failed = f"upstream {status}"
 
         def on_failed(ev):
             rid = ev.get("requestId")
+            if rid == self._upload_rid:
+                # never accepted, so this file will not reach the payload
+                self._upload_ok = -1
             if not self._net_urls.get(rid):
                 return
             # The site shows "Network Error. Please check your network status."
@@ -2788,6 +3028,14 @@ class DeepSeekSession:
 
             if self._net_failed:
                 yield "error", self._net_failed
+                return
+
+            # the site can drop the session while the answer is already coming;
+            # the page then sits on the sign-in wall with nothing left to read,
+            # and the idle timeout would hold the client for minutes
+            if await self._on_sign_in_page():
+                self._needs_login = True
+                yield "error", "chat.deepseek.com dropped the session"
                 return
 
             snap = await self._stream_snapshot()
@@ -2890,9 +3138,10 @@ class WorkerPool:
 
         Every worker used to start at index 0, so with a suspended account first
         they all jumped to "the first usable one after 0" - the same account,
-        every time. N browsers then hammered one account, and because
-        requests_on_account is per-worker each of them reported (1/2) and the
-        rotate_every budget was silently multiplied by the pool size.
+        every time. N browsers then hammered one account, and because the rotation budget was
+        per-worker each of them reported (1/2) and the rotate_every budget was
+        silently multiplied by the pool size. The counter is shared now, so the
+        budget means what it says.
         """
         n = len(self._accounts)
         for step in range(n):
@@ -2986,7 +3235,7 @@ async def accounts_status():
         "active_requests": pool.active_count,
         "browsers": len(pool._workers),
         "current_index": stats.account_idx if stats else 0,
-        "requests_on_account": stats.requests_on_account if stats else 0,
+        "requests_on_account": rotation_count(),
         "rotate_every": pool._rotate_every,
         "accounts": [
             {
@@ -3342,7 +3591,7 @@ async def chat_completions(request: Request):
                             return
                         try:
                             await wk.switch_account(nxt)
-                            wk.requests_on_account = 1
+                            set_rotation_count(1)
                             wk._log_serving()
                         except Exception as e:
                             fail_reason = str(e)
@@ -3495,7 +3744,7 @@ async def chat_completions(request: Request):
                         return sse({"error": {"message": fail_reason, "type": "proxy_error"}})
                     try:
                         await wk.switch_account(nxt)
-                        wk.requests_on_account = 1
+                        set_rotation_count(1)
                         wk._log_serving()
                     except Exception as e:
                         fail_reason = str(e)
@@ -3541,9 +3790,48 @@ async def chat_completions(request: Request):
     }
 
 
+# Result of the launch-time update check: (local_short, remote_short) when the
+# remote is ahead of us, else None. The check itself runs from the first moment
+# the script starts; the verdict is only voiced once Start is chosen.
+_update_available = None
+
+
+def _check_for_update():
+    """Compare the local HEAD with the remote's, once, off the menu thread."""
+    global _update_available
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        local = subprocess.check_output(
+            ["git", "-C", repo_dir, "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        remote_out = subprocess.check_output(
+            ["git", "-C", repo_dir, "ls-remote", "origin", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+    except Exception:
+        return                      # not a git checkout, or no network / origin
+    remote = remote_out.split()[0] if remote_out else ""
+    if local and remote and remote != local:
+        _update_available = (local[:7], remote[:7])
+
+
 async def main():
+    _enable_ansi()
+    _set_terminal_title("Free-DeepSeek-API")
+    # Kick the update check off immediately, but say nothing yet: the menu must
+    # not be interrupted. The verdict is printed only once Start is chosen.
+    update_task = spawn_bg(asyncio.to_thread(_check_for_update))
     pool.start_hider()   # keep worker windows hidden (Windows only, HEADLESS on)
     await run_menu()
+    # The check has had the whole time the menu was up; wait a little longer in
+    # case Start was pressed straight away, then report.
+    try:
+        await asyncio.wait_for(asyncio.shield(update_task), timeout=5)
+    except Exception:
+        pass
+    if _update_available:
+        log(f"[update] new version available: {_update_available[0]} -> "
+            f"{_update_available[1]}")
+        log("[update] update with: git pull")
     # No global browser here: the pool spawns one browser per active
     # request on demand (see WorkerPool.acquire).
     log(f"Starting OpenAI-compatible server on http://{HOST}:{PORT}/v1")
@@ -3577,6 +3865,15 @@ def _enable_ansi():
             kernel32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
         except Exception:
             pass
+
+
+def _set_terminal_title(title):
+    """Set the terminal/tab title (OSC 0). Ignored where unsupported."""
+    try:
+        sys.stdout.write(f"\x1b]0;{title}\x07")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def _clear():
@@ -3654,6 +3951,26 @@ def _ensure_terminal_width(min_w=None):
     while time.time() < deadline and _term_width() < min_w:
         time.sleep(0.02)
     grown = _term_width()
+    if grown >= min_w:
+        # The width query answers from the moment the console ACCEPTED the
+        # resize, not from the moment the screen has repainted at it. Drawing
+        # the first frame inside that window is the launch race: the banner is
+        # laid out for a grid the terminal is not showing yet, so it wraps and
+        # the caret walk counts the wrong rows. Wait for the width to hold
+        # still - still not a fixed pause - before handing it to the layout:
+        # two reads in a row that agree mean it has landed.
+        settle = time.time() + 0.5
+        stable = 0
+        while time.time() < settle:
+            time.sleep(0.02)
+            now = _term_width()
+            if now == grown:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+                grown = now
     if grown < min_w:
         # Keep _LAST_AUTO_WIDTH set so we do not spam a terminal that will
         # never grow. It resets to 0 as soon as the width is enough, so a
@@ -3836,6 +4153,22 @@ def _stats_lines(width):
             return f"{share:.2f}"
         return "<0.01"
 
+    def row_share(name, value):
+        whole = chars_total if name == "Characters" else token_total
+        return (value * 100 / whole) if whole else 0.0
+
+    # The percentage column sizes itself the same way the number column does:
+    # "<0.01" is five characters while "93" is two, so a fixed rjust(4) lets the
+    # one wide value shove its bar right and break the column. Measure every
+    # percentage that will actually be printed and pad to the widest.
+    pct_w = max(
+        (len(pct_text(row_share(name, value)))
+         for group, _ in GROUP_TITLES
+         for name, value in per_group[group]
+         if value),
+        default=4,
+    )
+
     def block(title, values, is_total):
         lines = [f"  {title}:"]
         for name, value in values:
@@ -3846,9 +4179,8 @@ def _stats_lines(width):
             if is_total:
                 lines.append(f"{head} | {_bar(1.0, room_for(head, width))} |")
                 continue
-            whole = chars_total if name == "Characters" else token_total
-            share = (value * 100 / whole) if whole else 0.0
-            head += f" | {pct_text(share).rjust(4)}%"
+            share = row_share(name, value)
+            head += f" | {pct_text(share).rjust(pct_w)}%"
             # The bar is sized from the row that is actually being built, so the
             # line can never reach the terminal width. room_for() has to see the
             # percentage too: measuring the head before the "|  93%" is appended
@@ -3880,7 +4212,7 @@ def open_accounts_file():
         log(f"[menu] could not open accounts.json: {e}", level="ERROR")
 
 
-GITHUB_URL = "https://github.com/lothiann/Free-ZAI-Api"  # inherited from the z.ai fork
+GITHUB_URL = "https://github.com/lothiann/Free-Deepseek-API"
 
 
 def open_github():
