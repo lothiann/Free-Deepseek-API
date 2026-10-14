@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import codecs
+import hashlib
 import json
 import re
 import secrets
@@ -73,6 +74,13 @@ SPA_CHAT_REUSE = True
 # the heap is what runs away on a ~2.6M character prompt. Above this, take the
 # reload deliberately instead of quietly inheriting a bloated page.
 SPA_HEAP_LIMIT_MB = 900
+# A hard cap on requests served from one warm document, whatever the heap says.
+# SPA_HEAP_LIMIT_MB cannot be the only guard: it reads V8's used heap, which is
+# not the number the browser reports for the tab, and Windows compresses the
+# process figure anyway - so a genuine leak can run for hundreds of requests
+# under the limit. Counting requests is deterministic and independent of how the
+# OS accounts memory, so the page is recycled on a schedule instead.
+SPA_MAX_REQUESTS = 15
 
 # Rotation budget shared by every worker. It used to live on the session, which
 # meant each browser spent its own rotate_every requests on the same account -
@@ -417,6 +425,7 @@ INPUT_READY_JS = """
 # before anyone looks at the alert; this reports 'ban' the moment it appears.
 COMPOSER_OR_BAN_JS = """
     () => {
+        if (window.__dsToast && window.__dsToast.length) return 'ban';
         // The ban notice is checked FIRST: the sidebar keeps a visible
         // textarea[name="search"] on the suspension page, so testing for a
         // composer before the alert reports "ready" and every later step then
@@ -604,6 +613,60 @@ SUSPENDED_JS = """
     }
 """
 
+# A suspension reaches the page two ways: the persistent ds-alert banner (which
+# SUSPENDED_JS reads) and a transient ds-toast--error that says the account was
+# "temporarily suspended" and is gone within seconds. A poll can race that
+# window, so a MutationObserver is installed at document start and every
+# matching toast is recorded into window.__dsToast; Python reads that record
+# whenever it needs to know, even after the toast itself has vanished.
+TOAST_WATCH_JS = """
+    (() => {
+      if (window.__dsToastWatch) return;
+      window.__dsToastWatch = true;
+      window.__dsToast = [];
+      const BLOCK = /suspend|violation of user polic|temporarily suspended/i;
+      const record = (el) => {
+        const txt = (el.innerText || el.textContent || '').trim();
+        if (txt && BLOCK.test(txt)) window.__dsToast.push(txt);
+      };
+      const scan = (node) => {
+        if (!node || node.nodeType !== 1) return;
+        const els = [];
+        if (node.classList && node.classList.contains('ds-toast')) els.push(node);
+        if (node.querySelectorAll)
+          els.push(...node.querySelectorAll('.ds-toast'));
+        for (const el of els) {
+          record(el);
+          setTimeout(() => record(el), 300);
+        }
+      };
+      const start = () => {
+        scan(document.body || document.documentElement);
+        new MutationObserver((muts) => {
+          for (const m of muts)
+            for (const n of m.addedNodes) scan(n);
+        }).observe(document.documentElement || document, {
+          childList: true, subtree: true
+        });
+      };
+      if (document.readyState === 'loading')
+        document.addEventListener('DOMContentLoaded', start);
+      else start();
+    })();
+"""
+
+# The last suspension toast captured on this document, or ''.
+TOAST_TEXT_JS = """
+    () => {
+        const a = window.__dsToast || [];
+        return a.length ? a[a.length - 1] : '';
+    }
+"""
+
+# What a suspension is written down as when the site does not state an exact
+# date: a month, which is what DeepSeek's temporary suspensions last.
+SUSPEND_DEFAULT_SECONDS = 30 * 86400
+
 EMAIL_INPUT_SEL = 'input[placeholder="Phone number / email address"]'
 PASSWORD_INPUT_SEL = 'input[type="password"]'
 LOGIN_BUTTON_SEL = 'div.ds-button--primary:has-text("Log in")'
@@ -747,6 +810,7 @@ A tool with no parameters:
 - A tool with no parameters is just <｜DSML｜ invoke name="clear">.
 - Parameter names MUST match that tool's schema exactly, and the tool name MUST be one of the <allowed_tools>.
 - If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
+- If you noticed a different format for tool calls, this is the norm, because all models have a DIFFERENT format for calling tools, and the user could switch the model to another one.
 - If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
 - Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\) - raw backslashes no longer break anything, but keep writing them doubled.
 - Raw inner quotes in string values are fine, they are plain text between the opening and the closing parameter tag: <｜DSML｜ parameter name="command" string="true">rg -n "pattern" src/</｜DSML｜ parameter>.
@@ -896,11 +960,12 @@ def _strip_cdata(v):
 
 
 def render_tools_block(tools):
-    """DeepSeek expects one JSON function schema per line under
-    '### Available Tool Schemas' - not an OpenAI {"tools": [...]} wrapper."""
-    return "\n".join(
-        json.dumps(t.get("function") or t, ensure_ascii=False) for t in tools
-    )
+    """Render the tool list as one compact JSON array line, one function schema
+    object per entry. Compact (no indent, no newline join) so the schemas sit
+    on a single line: the model must not see raw line breaks inside client-
+    sent data, and any control character in it stays escaped by json.dumps -
+    the same escaping the tool-call arguments use."""
+    return _unescape_value(json.dumps([t.get("function") or t for t in tools], ensure_ascii=False))
 
 
 def _trim_to_json_prefix(raw):
@@ -924,12 +989,72 @@ def _trim_to_json_prefix(raw):
     return raw
 
 
+# The escapes a model writes into a string="true" parameter. That payload is a
+# raw string with no JSON envelope around it, so a \n the model typed arrived as
+# two characters and reached the tool verbatim: a file the user asked to have one
+# newline in came out containing the two characters instead. The prompt teaches
+# exactly this convention, so decoding it is the documented meaning.
+#
+# Deliberately NOT codecs.decode(v, "unicode_escape"): that reinterprets the
+# bytes as latin-1 and mangles every non-ASCII character.
+_VALUE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
+                  '"': '"', "/": "/", "\\": "\\"}
+_HEX = "0123456789abcdefABCDEF"
+
+
+def _unescape_value(v):
+    """Decode the escape sequences a model writes into a string parameter.
+
+    One left-to-right pass, so \\\\n collapses to a single backslash followed by
+    an n instead of turning into a newline, and an escape this table does not
+    know (\\d, \\w, \\1 in a regex) keeps its backslash.
+    """
+    if "\\" not in v:
+        return v
+    out = []
+    i = 0
+    n = len(v)
+    while i < n:
+        c = v[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = v[i + 1]
+        if nxt == "u" and i + 6 <= n and all(ch in _HEX for ch in v[i + 2:i + 6]):
+            cp = int(v[i + 2:i + 6], 16)
+            i += 6
+            # JSON writes an astral character as a surrogate PAIR of two \u
+            # escapes. Decoding each half on its own yields two unpaired code
+            # units - an emoji came out as 0xd83d 0xde00 instead of one
+            # character - so the halves have to be joined, exactly as json.loads
+            # does it.
+            if (0xD800 <= cp <= 0xDBFF and v[i:i + 2] == "\\u" and i + 6 <= n
+                    and all(ch in _HEX for ch in v[i + 2:i + 6])):
+                low = int(v[i + 2:i + 6], 16)
+                if 0xDC00 <= low <= 0xDFFF:
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                    i += 6
+            out.append(chr(cp))
+            continue
+        if nxt in _VALUE_ESCAPES:
+            out.append(_VALUE_ESCAPES[nxt])
+            i += 2
+            continue
+        out.append(c)                       # unknown escape: keep the backslash
+        i += 1
+    return "".join(out)
+
+
 def _dsml_arg_to_json(key, raw, is_str):
     """One 'key: value' pair. string="true" -> the value is a raw string and gets
     JSON-encoded; string="false" -> the value is already JSON and is used as-is.
     Mirrors decode_dsml_to_arguments() in DeepSeek's own encoding.py."""
     if is_str:
-        raw = json.dumps(raw, ensure_ascii=False)
+        # escapes first, then JSON-encode: encoding the raw two-character \n
+        # would hand the tool a literal backslash-n, which is what the model
+        # meant as a newline
+        raw = json.dumps(_unescape_value(raw), ensure_ascii=False)
     return f"{json.dumps(key, ensure_ascii=False)}: {raw}"
 
 
@@ -1008,7 +1133,11 @@ def dsml_calls_block(calls):
         lines.append(f'<{DSML_TOKEN} invoke name="{name}">')
         for k, v in (arguments or {}).items():
             is_str = isinstance(v, str)
-            value = v if is_str else json.dumps(v, ensure_ascii=False)
+            # A string goes in as it is: the history line is decoded once, at
+            # assembly, so pre-escaping here would only add a layer to undo.
+            # Non-strings keep their JSON form so the type survives.
+            value = (v if isinstance(v, str)
+                     else json.dumps(v, ensure_ascii=False))
             lines.append(f'<{DSML_TOKEN} parameter name="{k}" string="{"true" if is_str else "false"}">{value}</{DSML_TOKEN} parameter>')
         lines.append(f"</{DSML_TOKEN} invoke>")
     return DSML_CALLS_OPEN + "\n" + "\n".join(lines) + "\n" + DSML_CALLS_CLOSE
@@ -1425,6 +1554,31 @@ def _hide_windows_for_pids(pids):
 
 # ===== STREAM PARSING =====
 
+_EXT_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+               "image/webp": ".webp", "image/gif": ".gif", "image/bmp": ".bmp"}
+
+
+def _src_ext(src):
+    """The file suffix for an attachment source: from the mime for a data:
+    URL, from the name for a path or link, and .png when neither is knowable."""
+    if src.startswith("data:"):
+        mime = (src[5:].split(";")[0] or "").strip().lower()
+        return _EXT_SUFFIX.get(mime, ".png")
+    return os.path.splitext(src.split("?")[0])[1].lower() or ".png"
+
+
+def _upload_name(src):
+    """The name a file is uploaded under, derived from its source alone.
+
+    The history marker is built before the upload runs, so a random tempfile
+    name could never be reported there. Deriving it from the source instead
+    means the name the site receives and the name the transcript shows are the
+    same without any shared state between the two passes.
+    """
+    tok = hashlib.md5(src.encode("utf-8", "replace")).hexdigest()[:8]
+    return "dsimg" + tok + _src_ext(src)
+
+
 def collect_image_parts(messages):
     """Pull image_url parts out of the OpenAI-style messages.
 
@@ -1447,17 +1601,130 @@ def collect_image_parts(messages):
                 if url.startswith("data:"):
                     head, _, b64 = url.partition(",")
                     mime = head[5:].split(";")[0] or "image/png"
-                    out.append({"data": base64.b64decode(b64), "mime": mime})
+                    out.append({"data": base64.b64decode(b64), "mime": mime,
+                                "src": url, "name": _upload_name(url)})
                 elif url.startswith("http://") or url.startswith("https://"):
                     with urllib.request.urlopen(url, timeout=30) as r:
                         blob = r.read()
                     ctype = (r.headers.get("Content-Type") or "").split(";")[0]
                     if not ctype.startswith("image/"):
                         continue
-                    out.append({"data": blob, "mime": ctype})
+                    out.append({"data": blob, "mime": ctype,
+                                "src": url, "name": _upload_name(url)})
             except Exception as e:
                 log(f"[vision] skipped image ({e})", level="WARN")
     return out
+
+
+# Only the part types this site is actually sent an attachment for. A video_url
+# is NOT in the list on purpose: collect_image_parts above does not upload it,
+# so marking one in the history would claim the model can see a file DeepSeek
+# never received. It stays invisible until the upload path learns to carry it.
+_MEDIA_PART_TYPES = ("image_url",)
+
+
+def _content_str(c):
+    """The text of one message, with the media parts dropped.
+
+    Module level, not a local of build_prompt: _history_content needs it too,
+    and a helper that only exists inside the one function that uses it cannot be
+    reused or tested on its own.
+    """
+    if isinstance(c, list):
+        return "\n".join(
+            x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"
+        )
+    if isinstance(c, str):
+        return c
+    return json.dumps(c, ensure_ascii=False)
+
+
+def _media_marker(part, kind):
+    """The history marker for one attachment.
+
+    {"type", "name"} always - name being the exact name the file is uploaded
+    under - plus "url" when the picture arrived as a link, or "path" when it
+    came from a local file, never both. Returns None for a part with no source
+    at all, so the history never claims a file the site did not get. A data:
+    URL has no source outside the request itself, so it carries the name alone.
+    """
+    holder = part.get(kind)
+    if isinstance(holder, str):
+        src = holder
+    elif isinstance(holder, dict):
+        src = (holder.get("url") or holder.get("file_data")
+               or holder.get("path") or holder.get("file_id") or "")
+    else:
+        src = ""
+    if not isinstance(src, str) or not src:
+        return None
+    marker = {"type": kind, "name": _upload_name(src)}
+    if src.startswith("data:"):
+        return marker
+    if src.startswith(("http://", "https://")):
+        marker["url"] = src
+    else:
+        marker["path"] = src
+    return marker
+
+
+def _history_content(c):
+    """One message's content for a history line.
+
+    Returns an OpenAI-shaped LIST when the message carried an attachment, with
+    the media part left in the position it was sent between the text parts, and
+    the plain flattened string when it did not.
+
+    Keeping the part in place is the whole point. The upload already went to the
+    site through collect_image_parts, but the transcript is what the model reads
+    on every later turn, and a line that joins only the text parts leaves it
+    unable to tell that there was a picture there at all, let alone which
+    sentence it belonged to.
+    """
+    if not isinstance(c, list):
+        return _content_str(c)
+    if not any(isinstance(p, dict) and p.get("type") in _MEDIA_PART_TYPES
+               for p in c):
+        return _content_str(c)
+    out = []
+    for p in c:
+        if not isinstance(p, dict):
+            continue
+        kind = p.get("type")
+        if kind in _MEDIA_PART_TYPES:
+            marker = _media_marker(p, kind)
+            if marker is None:
+                continue                     # never uploaded -> never claimed
+            out.append(marker)
+        elif kind == "text":
+            out.append({"type": "text", "text": p.get("text", "")})
+    return out or _content_str(c)
+
+
+def _tool_history_content(raw):
+    """A tool result for the history line, in OpenAI shape when it carried a file.
+
+    <tool_result> is ours, not OpenAI's, and the prompt describes the result as
+    a string wrapped in it - so the tag goes around the TEXT parts while the
+    media parts stay real parts beside them. Open the tag on the first text
+    part and close it on the last, which keeps the text/file interleaving the
+    caller sent, and the shape the model is told to expect.
+    """
+    content = _history_content(raw)
+    if isinstance(content, str):
+        return f"<tool_result>{content}</tool_result>"
+    text_at = [i for i, p in enumerate(content) if p.get("type") == "text"]
+    if not text_at:
+        return content
+    first, last = text_at[0], text_at[-1]
+    for i in text_at:
+        t = content[i]["text"]
+        if i == first:
+            t = "<tool_result>" + t
+        if i == last:
+            t = t + "</tool_result>"
+        content[i]["text"] = t
+    return content
 
 
 def map_thinking(model=None):
@@ -1477,6 +1744,23 @@ def map_thinking(model=None):
 # lifted into a role=system line right after the header. The prompt is pasted
 # verbatim into DeepSeek's composer, which is single-turn, so the whole
 # conversation has to travel as text.
+
+def _serialize_history_obj(obj):
+    """Serialize a history dict to human-readable JSON-like format.
+    String values keep real newlines; backslashes and quotes are escaped.
+    Non-string values use json.dumps.
+    """
+    import json
+    parts = []
+    for k, v in obj.items():
+        if isinstance(v, str):
+            # escape backslash and quote; keep real newlines as-is
+            val = v.replace('"', '\\"')
+            parts.append(f'"{k}": "{val}"')
+        else:
+            parts.append(f'"{k}": {json.dumps(v, ensure_ascii=False)}')
+    return "{" + ", ".join(parts) + "}"
+
 def build_prompt(messages, tools=None):
     last_user = ""
     call_label_by_id = {}
@@ -1495,15 +1779,6 @@ def build_prompt(messages, tools=None):
             if cid:
                 call_label_by_id[cid] = label
 
-    def _content_str(c):
-        if isinstance(c, list):
-            return "\n".join(
-                x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"
-            )
-        if isinstance(c, str):
-            return c
-        return json.dumps(c, ensure_ascii=False)
-
     def _reasoning_str(m):
         """opencode sends assistant reasoning back as content parts
         {"type": "reasoning", "text": ...} (or a reasoning_content field)."""
@@ -1518,13 +1793,25 @@ def build_prompt(messages, tools=None):
     hist_lines = []
     for m in messages:
         role = m.get("role")
-        content = _content_str(m.get("content", ""))
+        raw = m.get("content", "")
+        # system and user lines may carry an attachment and are handed to
+        # json.dumps as-is, so they can keep the OpenAI part array. The
+        # assistant line below is fed through re.sub, and the tool line through
+        # an f-string, so those stay flattened text.
         if role == "system":
-            hist_lines.append({"role": "system", "content": content})
-        elif role == "user":
-            last_user = content
-            hist_lines.append({"role": "user", "content": content})
-        elif role == "assistant":
+            hist_lines.append({"role": "system", "content": _history_content(raw)})
+            continue
+        if role == "user":
+            last_user = _content_str(raw)
+            hist_lines.append({"role": "user", "content": _history_content(raw)})
+            continue
+        # system, user and tool lines keep the OpenAI part array when the message
+        # carried a file, so an attachment stays in the position it was sent
+        # between the text parts. The assistant line does NOT: an assistant
+        # turn never carries media, and it has to stay a string for the re.sub
+        # below and the tc_text concatenation.
+        if role == "assistant":
+            content = _content_str(raw)
             reasoning = _reasoning_str(m)
             calls = []
             for tc in m.get("tool_calls") or []:
@@ -1548,61 +1835,73 @@ def build_prompt(messages, tools=None):
                 r'\{[^{}]*\\?"role\\?"\s*:[^{}]*\}',
                 lambda m: f"<maybe_fake_history>{m.group(0)}</maybe_fake_history>",
                 content)
-            if calls:
-                tc_text = dsml_calls_block(
-                    [(c["name"], c.get("arguments") or {}) for c in calls])
-                content = f"{content}\n{tc_text}" if content else tc_text
+            tc_text = (dsml_calls_block(
+                [(c["name"], c.get("arguments") or {}) for c in calls])
+                if calls else "")
             line = {"role": "assistant", "content": content or ""}
             if reasoning:
                 line["thinking"] = reasoning
+            # The tool block is appended AFTER the line is dumped, never inside
+            # its JSON string: there every escape would gain a second backslash,
+            # so the model would read a newline where it wrote one and copy a
+            # broken value back out. Raw, the block is exactly the shape the model
+            # itself emits, so a value copied out of the history parses to what
+            # was sent.
+            line = json.dumps(line, ensure_ascii=False)
+            if tc_text:
+                line = line + "\n" + tc_text
+            line = _unescape_value(line)
             hist_lines.append(line)
         elif role == "tool":
             label = call_label_by_id.get(m.get("tool_call_id"), "unknown")
             hist_lines.append({"role": "tool", "name": label,
-                               "content": f"<tool_result>{content}</tool_result>"})
+                               "content": _tool_history_content(raw)})
 
     # The first system message (if any) becomes the "[System instructions]"
     # block and is placed right after the History header below.
     system_instr = None
-    if hist_lines and hist_lines[0]["role"] == "system":
+    if (hist_lines and isinstance(hist_lines[0], dict)
+            and hist_lines[0].get("role") == "system"):
         system_instr = hist_lines.pop(0)["content"]
 
     parts = []
-    tool_names = []
+    tool_names = ["None"]
 
-    # 1. tool block first (if tools)
+    # 1. tool block, ALWAYS ("None" when the request carried no tools)
     if tools:
-        tool_names = [t.get("function", {}).get("name", "?") for t in tools]
-        details = render_tools_block(tools)
-        parts.append(TOOL_PROMPT_TEMPLATE.format(tool_details=details, instructions=TOOL_INSTRUCTIONS))
-    # 2. Allowed tools (only if tools)
-    if tools:
+        tool_names = [t.get("function", {}).get("name", "?") for t in tools] or ["None"]
+    details = render_tools_block(tools) if tools else "None"
+    parts.append(TOOL_PROMPT_TEMPLATE.format(tool_details=details, instructions=TOOL_INSTRUCTIONS))
+    # 2. Allowed tools, ALWAYS (tool_names defaults to ["None"])
+    if tool_names:
         parts.append("<allowed_tools>\n Allowed tools: " + ", ".join(tool_names) + "\n</allowed_tools>")
     # 3. History header
     parts.append("# History (oldest first), each line is one message:")
     # [System instructions] directly after the history header, as a proper
     # role=system message line
     if system_instr:
-        parts.append(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False))
+        parts.append(_unescape_value(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False)))
     # 4. FINAL_SYSTEM_MESSAGE as a separate line (only if tools)
     if tools:
         final_line = json.dumps({"role": "system", "content": FINAL_SYSTEM_MESSAGE}, ensure_ascii=False)
-        # The convo text is pasted verbatim into the site's input, so the
-        # model reads the JSONL escapes literally (\\n shows as two
-        # backslashes). Collapse one layer so \\n / \\" in the source
-        # reach the model as the intended single backslash.
-        final_line = final_line.replace("\\\\", "\\").replace("\\\\\"", "\\\"")
-        parts.append(final_line)
+        parts.append(_unescape_value(final_line))
     # 5. Each history line as JSONL
-    parts.extend(json.dumps(h, ensure_ascii=False) for h in hist_lines)
+    for h in hist_lines:
+        # An assistant turn that carried tool calls is already rendered.
+        if isinstance(h, str):
+            parts.append(h)
+        elif isinstance(h, dict):
+            parts.append(_unescape_value(json.dumps(h, ensure_ascii=False)))
+        else:
+            parts.append(json.dumps(h, ensure_ascii=False))
 
     convo = "\n\n".join(parts)
 
     return (
         f"{convo}\n\n"
-        f"---\n"
+        f"<task>\n"
         f"{SYSTEM_CONTINUE}\n"
-        f"Write Assistant's reply (ONLY content)"
+        f"Continue (Or write if you haven't received an answer yet) Assistant's reply, ONLY content\n</task>"
     ), last_user
 
 
@@ -2213,6 +2512,8 @@ class DeepSeekSession:
         # no amount of retrying on it will help
         self._needs_login = False
         self._warm = False
+        # requests served from the current warm document, reset on every reload
+        self._spa_served = 0
         self._net_dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.context = None
         self.lock = asyncio.Lock()
@@ -2252,6 +2553,7 @@ class DeepSeekSession:
             color_scheme="light",
         )
         await self.context.add_init_script(ACCOUNT_SHIM_JS)
+        await self.context.add_init_script(TOAST_WATCH_JS)
         if HEADLESS:
             self.hide_pids = _cloak_chrome_pids()
             _hide_windows_for_pids(self.hide_pids)
@@ -2480,6 +2782,14 @@ class DeepSeekSession:
         """
         if not SPA_CHAT_REUSE or not self._warm:
             return False
+        if self._spa_served >= SPA_MAX_REQUESTS:
+            # The budget is spent, so the document goes - not because anything
+            # measurable crossed a line, but because a per-navigation leak only
+            # ever gets collected when the document does.
+            log(f"[spa] {self._spa_served} requests on this page - full reload",
+                level="WARN")
+            self._warm = False
+            return False
         if self._needs_login:
             # the site already refused this session, and a warm page keeps
             # showing its composer regardless - fall through to the branch that
@@ -2517,7 +2827,11 @@ class DeepSeekSession:
         """Load a brand-new chat. DeepSeek pre-creates a chat session on every
         page load, so navigating to '/' gives each API call a clean context."""
         if await self._spa_new_chat():
+            # counted here, where the choice is actually made: a request served
+            # from the warm page is one the next reload has to pay for
+            self._spa_served += 1
             return True
+        self._spa_served = 0
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
         # Known mute: no composer is coming, so do not wait out the timeout and
         # then log in for nothing. The suspension banner is normally mounted by
@@ -2559,6 +2873,52 @@ class DeepSeekSession:
         return (f"account #{self.account_idx} ({self._label(self.account_idx)}) chat is "
                 f"muted until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}")
 
+    def _mute_account(self, text, seconds=SUSPEND_DEFAULT_SECONDS):
+        """Write a suspension down as a mute deadline on the current account.
+
+        The persistent ds-alert banner and the transient ds-toast say the same
+        thing - this account cannot chat - so both are mirrored into the same
+        mute_until the /api/v0/users/current response fills. Rotation then skips
+        the account until the deadline instead of rediscovering the ban on every
+        request. When the site does not state an exact date a month is assumed,
+        which is what these temporary suspensions last.
+        """
+        until = time.time() + seconds
+        acc = self.current_account
+        prev = acc.get("mute_until") or 0
+        try:
+            prev = float(prev)
+        except (TypeError, ValueError):
+            prev = 0
+        if until > prev:
+            acc["mute_until"] = until
+            save_accounts(self.accounts, self.rotate_every)
+            log(f"[mute] account #{self.account_idx} ({self._label(self.account_idx)}) "
+                f"muted until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M} - "
+                f"rotation skips it until then")
+        self._last_ban = text or self._last_ban
+        return text
+
+    async def _note_toast(self):
+        """Record the transient suspension toast, if the observer captured one.
+
+        The toast is gone within seconds, so the page is never trusted to still
+        be showing it: TOAST_WATCH_JS keeps a copy in window.__dsToast and this
+        reads that. Recording it here means the account is skipped by rotation
+        even though the moment itself has passed.
+        """
+        try:
+            text = (await self.page.evaluate(TOAST_TEXT_JS) or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            return ""
+        self._mute_account(text)
+        if not self._ban_announced:
+            log(f"[account #{self.account_idx}] SUSPENDED: {text}", level="ERROR")
+            self._ban_announced = True
+        return text
+
     async def _note_suspension(self):
         """Read the ban notice off the page and print it once.
 
@@ -2576,6 +2936,7 @@ class DeepSeekSession:
         if not suspended:
             return ''
         self._last_ban = suspended
+        self._mute_account(suspended)
         if not self._ban_announced:
             # The site states the ban in its own words, so all of it is printed -
             # one line, same [ERROR] shape as every other line, and fully red
@@ -2605,7 +2966,7 @@ class DeepSeekSession:
         while True:
             state = await poll_js(self.page, COMPOSER_OR_BAN_JS, timeout_s=0.5)
             if state == "ban":
-                return await self._note_suspension()
+                return await self._note_suspension() or await self._note_toast()
             # a composer, or the sign-in wall, means there is no banner to wait for
             if state == "ready" or await self._on_sign_in_page():
                 return ''
@@ -2616,11 +2977,12 @@ class DeepSeekSession:
         """Explain a missing composer. A suspended account renders a notice
         instead of the chat UI, and no amount of logging in will fix that."""
         suspended = await self._note_suspension()
+        toast = await self._note_toast()
         # The banner is printed once, in full, by _note_suspension. This reason
         # is handed to the retry path, so repeating the whole notice here is
         # what produced two identical SUSPENDED lines a millisecond apart.
         if self._last_ban or self._mute_reason():
-            return "account suspended" if suspended else self._mute_reason()
+            return "account suspended" if (suspended or toast) else self._mute_reason()
         return "chat.deepseek.com never rendered the composer"
 
     # ---------------- rotation / retry ----------------
@@ -2688,7 +3050,8 @@ class DeepSeekSession:
             try:
                 if fn == "evaluate":
                     await self.page.evaluate(
-                        "try{localStorage.clear();sessionStorage.clear();}catch(e){}")
+                        "try{localStorage.clear();sessionStorage.clear();"
+                        "window.__dsToast=[];}catch(e){}")
                 else:
                     await self.context.clear_cookies()
             except Exception:
@@ -2821,13 +3184,14 @@ class DeepSeekSession:
         which is how DeepSeek does vision. The prompt text itself is unchanged
         (build_prompt keeps only the text parts, as it always did)."""
         paths = []
+        # One private directory per attach: every file keeps the exact name the
+        # transcript marker reports, and two requests carrying the same picture
+        # cannot collide in the shared temp directory while they upload.
+        tmpdir = tempfile.mkdtemp(prefix="dsimg_")
         try:
-            for i, blob in enumerate(images):
-                suffix = {"image/png": ".png", "image/jpeg": ".jpg",
-                          "image/webp": ".webp", "image/gif": ".gif"}.get(
-                              blob.get("mime", ""), ".png")
-                fd, path = tempfile.mkstemp(prefix="dsimg", suffix=suffix)
-                with os.fdopen(fd, "wb") as fh:
+            for blob in images:
+                path = os.path.join(tmpdir, blob["name"])
+                with open(path, "wb") as fh:
                     fh.write(blob["data"])
                 paths.append(path)
             # A failed upload used to pass silently: the request went out without
@@ -2863,6 +3227,10 @@ class DeepSeekSession:
                     os.unlink(p_)
                 except OSError:
                     pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
 
     async def send_message(self, prompt, thinking=False, search=False,
                            model_type=DEFAULT_MODEL_TYPE, images=None):
@@ -3089,11 +3457,21 @@ class DeepSeekSession:
         started = False
         retry_clicked = False
         last_retry_try = 0.0
+        last_toast_check = 0.0
         # last_captcha_check = 0.0
 
         while True:
             if await self.stop_if_client_gone():
                 return
+
+            # A suspension toast can pop mid-generation; check it cheaply (once
+            # a second) before any error path so the account is written down and
+            # the retry can move to the next one.
+            if time.time() - last_toast_check > 1.0:
+                last_toast_check = time.time()
+                if await self._note_toast():
+                    yield "error", "account suspended"
+                    return
 
             if self._net_failed:
                 yield "error", self._net_failed
@@ -3660,7 +4038,7 @@ async def chat_completions(request: Request):
                     log(f"[request] {why} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
                     # A suspended account never recovers on reload, so spend the
                     # retry on the next one instead of the same dead account.
-                    if self._dead_account(wk, fail_reason) and len(wk.accounts) > 1:
+                    if DeepSeekSession._dead_account(wk, fail_reason) and len(wk.accounts) > 1:
                         wk._last_ban = ''
                         nxt = wk.pick_next_usable(wk.account_idx)
                         if nxt is None:
@@ -3815,14 +4193,15 @@ async def chat_completions(request: Request):
                 log(f"[request] {why} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
                 # A suspended account never recovers on reload, so spend the
                 # retry on the next one instead of the same dead account.
-                if self._dead_account(wk, fail_reason) and len(wk.accounts) > 1:
+                if DeepSeekSession._dead_account(wk, fail_reason) and len(wk.accounts) > 1:
                     wk._last_ban = ''
                     nxt = wk.pick_next_usable(wk.account_idx)
                     if nxt is None:
                         # every account is muted: none of them can render a
                         # composer, so retrying cannot help
                         log("[request] every account is muted - nothing to rotate to", level="ERROR")
-                        return sse({"error": {"message": fail_reason, "type": "proxy_error"}})
+                        return JSONResponse({"error": {"message": fail_reason, "type": "proxy_error"}},
+                                            status_code=502)
                     try:
                         await wk.switch_account(nxt)
                         set_rotation_count(1)
@@ -4175,6 +4554,89 @@ def _bar(fraction, width, minimum=False):
     return "".join(cells)
 
 
+
+
+def _mute_left_text(seconds):
+    """Seconds until a mute lifts, as a compact '1d 2h' / '3h 4m' / '5m'.
+
+    Only the two largest units are printed: a mute runs for hours or days, and
+    the minute tail is noise once there is an hour in front of it.
+    """
+    seconds = int(max(0, seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    mins = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def _account_rows(accounts, width):
+    """One row per account: who it is, until when, and for how much longer.
+
+    A row that reached the terminal width would wrap, and a wrapped row shifts
+    everything under it - which is what the caret walk at the end of the menu
+    counts. So a long email folds its deadline onto a second line instead of
+    being allowed to wrap, and the account name is never truncated: it is the
+    only thing on the row that identifies the account.
+    """
+    def name_of(i, acc):
+        return (acc.get("email") or "").strip() or f"account #{i}"
+
+    name_w = max(_visible_len(name_of(i, a)) for i, a in enumerate(accounts))
+    out = []
+    for i, acc in enumerate(accounts):
+        left = mute_left(acc)
+        if left > 0:
+            try:
+                deadline = datetime.fromtimestamp(
+                    float(acc.get("mute_until") or 0)).strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError, OSError):
+                deadline = "-"
+            remained = _mute_left_text(left)
+        else:
+            deadline = remained = "-"
+        head = f"  - {name_of(i, acc):<{name_w}}"
+        row = f"{head} | Mute until: {deadline} | Remained: {remained}"
+        if _visible_len(row) < width:
+            out.append(row)
+            continue
+        # Too narrow for both fields on one row, so each takes a row of its own.
+        # The name is repeated rather than the second row being left unbulleted:
+        # every row of the block keeps its "- " marker, which is what the caret
+        # arithmetic in the menu counts rows by. Both rows are measured before
+        # committing - the deadline row is the longer one.
+        row = f"{head} | Remained: {remained}"
+        fields = f"{head} | Mute until: {deadline}"
+        if (_visible_len(row) < width and _visible_len(fields) < width):
+            out.append(row)
+            out.append(fields)
+            continue
+        # Narrower still: the name takes a row alone and each field follows it.
+        # The address is never cut - it is the only thing on the row that
+        # identifies the account - so it is the last thing to give way.
+        out.append(f"  - {name_of(i, acc)}")
+        out.append(f"  - Mute until: {deadline}")
+        out.append(f"  - Remained: {remained}")
+    return out
+
+
+def _accounts_block(width):
+    """Which accounts rotation can use right now, under the usage numbers.
+
+    Rotation skips a muted account silently, so accounts.json was the only
+    place that state was ever visible. The deadline comes from the same
+    mute_until mute_left() and is_usable() read, so this block cannot disagree
+    with the pool about who is being skipped.
+    """
+    accounts = getattr(pool, "_accounts", None) or []
+    if not accounts:
+        return []
+    return ["  Accounts:"] + _account_rows(accounts, width)
+
+
 # Group key -> heading. The split follows the reasoning switch, so it tracks
 # what actually costs tokens rather than the model list, which the site serves
 # dynamically.
@@ -4188,10 +4650,13 @@ def _stats_lines(width):
     the numbers stay meaningful without inventing a quota: "All" is always
     100% and a group is whatever slice of it it has actually used."""
     rows, total = USAGE.snapshot()
+    accounts = _accounts_block(width)
     if not any(total.values()):
         # Nothing has been served yet (a fresh stats.json). A block of zeroes
-        # and full bars says less than showing no block at all.
-        return []
+        # and full bars says less than showing no block at all - but which
+        # accounts are muted right now is live state and is worth showing even
+        # before the first token is served.
+        return accounts
     grand = _metric_values(total)
     grand_map = dict(grand)
 
@@ -4244,8 +4709,8 @@ def _stats_lines(width):
     # percentage that will actually be printed and pad to the widest.
     pct_w = max(
         (len(pct_text(row_share(name, value)))
-         for group, _ in GROUP_TITLES
-         for name, value in per_group[group]
+         for values in per_group.values()
+         for name, value in values
          if value),
         default=4,
     )
@@ -4275,6 +4740,8 @@ def _stats_lines(width):
     for group, title in GROUP_TITLES:
         if any(rows.get(group, {}).values()):
             out += [""] + block(title, per_group[group], False)
+    if accounts:
+        out += [""] + accounts
     return out
 
 
