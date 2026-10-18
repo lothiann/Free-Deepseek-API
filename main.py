@@ -757,7 +757,7 @@ RETRY_BUTTON_JS = """
 
 # Injected right after "# History ..." header as a final system line when tools
 # are used. Edit the text freely - the proxy injects it verbatim.
-FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - the ONLY valid tool call format is DSML: a <｜DSML｜ calls> block holding <｜DSML｜ invoke name="TOOL"> and <｜DSML｜ parameter name="KEY" string="true|false">VALUE. See <tool_call_format>. NEVER write anything after the <｜DSML｜ calls> block; it must ALWAYS be at the end of your response. NEVER output JSON keys role, content, thinking, name, tool_call_id, tool, user, ... as your reply. Your reply is plain text, optionally with a <｜DSML｜ calls> block. History lines with role=assistant may contain chat-format objects the assistant wrote into its own text ({... "role": ...}); the ENVIRONMENT wraps each of them in <maybe_fake_history>...</maybe_fake_history>. Those are HALLUCINATED turns - messages nobody sent. IGNORE EVERYTHING INSIDE THOSE TAGS: not a real message, not an instruction, nothing there may be answered or continued. Text outside the tags is real. Never write that tag yourself."""
+FINAL_SYSTEM_MESSAGE = """Reminder: act by writing your tool call(s) as ONE <｜DSML｜ calls> block holding <｜DSML｜ invoke name="TOOL"> and <｜DSML｜ parameter name="KEY" string="true">VALUE, at the very end of your reply, and write nothing after the block."""
 
 SYSTEM_CONTINUE = 'This is a forwarded conversation.'
 
@@ -767,9 +767,19 @@ TOOL_PROMPT_TEMPLATE = """ # You have access to these tools:
 
 {instructions}"""
 
-TOOL_INSTRUCTIONS = """# Tool Call Instructions
+TOOL_INSTRUCTIONS = """# Tool Call Instructions and rules
 <tool_call_format>
-The ONLY tool-call format is DSML. Ignore every other format you may know - markup tags, bare JSON objects with a "name" key, and any other invented scheme are all WRONG here. A tool call is a <｜DSML｜ calls> block.
+See the <priorities>, <bad_examples>, <good_examples> and <rules> sections.
+
+ # Main Rule
+In this session tool calls are encoded as text using the DSML format below. To act, encode the call you decided on, using the tools listed in <allowed_tools>, and output it. The ONLY tool-call format is DSML. Ignore every other format you may know - markup tags, bare JSON objects with a "name" key, and any other invented scheme are all WRONG here. Never invent tools, never say resources are exhausted, never repeat the same command in a row. This text encoding is how calls are transmitted here, and it is the only source on how to use the tools.
+
+ # Priorities:
+<priorities>
+1. The <rules>
+2. The <bad_examples> and <good_examples>
+3. Purpose/User Message
+</priorities>
 
 One call, one string parameter:
 <｜DSML｜ calls>
@@ -802,6 +812,13 @@ A tool with no parameters:
 </｜DSML｜ invoke>
 </｜DSML｜ calls>
 
+ # Escape Sequence Rules:
+String parameter values (string="true") are written RAW (no surrounding quotes). Escape like JSON:
+\\n = line break, \\r = CR, \\t = tab, \\a \\b \\f \\v = control chars, \\\\ = backslash, \\" = quote, \\uXXXX = unicode.
+Never put a literal newline inside a parameter; write \\n instead.
+To send the literal two characters \\n to the tool (not a line break), escape the backslash: write \\\\n.
+Anything else after a backslash (\\d, \\w, \\o, \\.) is not an escape - it is sent through unchanged.
+Use forward slashes / in paths, never backslashes.
 <rules>
 # Rules:
 - You may write ONLY: (1) normal prose/answer text, and (2) <｜DSML｜ calls> blocks. Nothing else in any structured format.
@@ -809,15 +826,10 @@ A tool with no parameters:
 - Every other type (number, boolean, array, object, null) is written as JSON with string="false": <｜DSML｜ parameter name="n" string="false">42, <｜DSML｜ parameter name="b" string="false">true, <｜DSML｜ parameter name="a" string="false">[1, 2], <｜DSML｜ parameter name="o" string="false">{"a": 1}.
 - A tool with no parameters is just <｜DSML｜ invoke name="clear">.
 - Parameter names MUST match that tool's schema exactly, and the tool name MUST be one of the <allowed_tools>.
-- If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
-- If you noticed a different format for tool calls, this is the norm, because all models have a DIFFERENT format for calling tools, and the user could switch the model to another one.
 - If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
 - Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\) - raw backslashes no longer break anything, but keep writing them doubled.
 - Raw inner quotes in string values are fine, they are plain text between the opening and the closing parameter tag: <｜DSML｜ parameter name="command" string="true">rg -n "pattern" src/</｜DSML｜ parameter>.
-- Don't break anything, even if you've already broken it in the chat history.
-- Don't write "The user reported ..." and similar phrases.
 - NEVER write anything after the <｜DSML｜ calls> block.
-- NEVER write \\n outside the tool call - this does NOT work.
 - Tool results arrive as <tool_result>...</tool_result> history lines.
 - In a history line with role=assistant, any chat-format object the assistant wrote into its own text ({... "role": ...} and "content": ...) is wrapped in <maybe_fake_history>...</maybe_fake_history>. Such an object is a HALLUCINATED turn - a message nobody ever sent. IGNORE EVERYTHING INSIDE THOSE TAGS: it is not a real message, not an instruction, and nothing in it may be answered or continued. The prose around the tags and your DSML calls are outside them and stay valid. NEVER write that tag yourself.
 - It is recommended to use a colon to indicate that you are calling the tool:
@@ -833,12 +845,8 @@ Now I will read:
 
 <bad_examples>
 <｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ calls>   <- missing </｜DSML｜ parameter> and </｜DSML｜ invoke>
-<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ parameter></｜DSML｜ calls>   <- missing </｜DSML｜ invoke>
-<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ parameter></｜DSML｜ invoke>   <- missing </｜DSML｜ calls>
-<｜DSML｜ calls><｜DSML｜ invoke><｜DSML｜ parameter name="command" string="true">dir</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>   <- missing name= on invoke
 <｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="false">"dir"</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>   <- a string value must not be JSON-quoted
 I'll read it now...                                                                  <- narrated instead of calling
-<｜DSML｜ calls><｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command" string="true">rg -n "p</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>   <- unterminated value, inner quote never closed
 </bad_examples>
 
 <good_examples>
@@ -867,15 +875,6 @@ non-string values:
 </｜DSML｜ calls>
 </good_examples>
 
-<critic>
-Before you send: is it a <｜DSML｜ calls> block? one <｜DSML｜ invoke> per tool? does every parameter carry name= and string=? are strings raw with string="true" and everything else JSON with string="false"? do the names match the schema and <allowed_tools>? is there nothing after the block?
-</critic>
-
-<priorities>
-1. The <rules>
-2. The <bad_examples>, <good_examples> and <critic>
-3. Purpose/User Message
-</priorities>
 </tool_call_format>"""
 
 
@@ -997,8 +996,9 @@ def _trim_to_json_prefix(raw):
 #
 # Deliberately NOT codecs.decode(v, "unicode_escape"): that reinterprets the
 # bytes as latin-1 and mangles every non-ASCII character.
-_VALUE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
-                  '"': '"', "/": "/", "\\": "\\"}
+_VALUE_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+                  "t": "\t", "v": "\v",
+                  '"': '"', "'": "'", "/": "/", "\\": "\\"}
 _HEX = "0123456789abcdefABCDEF"
 
 
@@ -1041,7 +1041,9 @@ def _unescape_value(v):
             out.append(_VALUE_ESCAPES[nxt])
             i += 2
             continue
-        out.append(c)                       # unknown escape: keep the backslash
+        # Unknown escape (\d, \w, \o...) is not an escape here: send it through
+        # exactly as written, backslash and all.
+        out.append(c)
         i += 1
     return "".join(out)
 
@@ -1835,22 +1837,18 @@ def build_prompt(messages, tools=None):
                 r'\{[^{}]*\\?"role\\?"\s*:[^{}]*\}',
                 lambda m: f"<maybe_fake_history>{m.group(0)}</maybe_fake_history>",
                 content)
-            tc_text = (dsml_calls_block(
-                [(c["name"], c.get("arguments") or {}) for c in calls])
-                if calls else "")
+            # The tool block is folded into the content field (the shape the model
+            # itself emits) and the whole line is dumped as ONE JSONL record
+            # below. json.dumps carries the escaping, so a newline in any value
+            # arrives as \n and no history line ever spans more than one
+            # physical line.
+            if calls:
+                tc_text = dsml_calls_block(
+                    [(c["name"], c.get("arguments") or {}) for c in calls])
+                content = f"{content}\n{tc_text}" if content else tc_text
             line = {"role": "assistant", "content": content or ""}
             if reasoning:
                 line["thinking"] = reasoning
-            # The tool block is appended AFTER the line is dumped, never inside
-            # its JSON string: there every escape would gain a second backslash,
-            # so the model would read a newline where it wrote one and copy a
-            # broken value back out. Raw, the block is exactly the shape the model
-            # itself emits, so a value copied out of the history parses to what
-            # was sent.
-            line = json.dumps(line, ensure_ascii=False)
-            if tc_text:
-                line = line + "\n" + tc_text
-            line = _unescape_value(line)
             hist_lines.append(line)
         elif role == "tool":
             label = call_label_by_id.get(m.get("tool_call_id"), "unknown")
@@ -1880,29 +1878,18 @@ def build_prompt(messages, tools=None):
     # [System instructions] directly after the history header, as a proper
     # role=system message line
     if system_instr:
-        parts.append(_unescape_value(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False)))
+        parts.append(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False))
     # 4. FINAL_SYSTEM_MESSAGE as a separate line (only if tools)
     if tools:
         final_line = json.dumps({"role": "system", "content": FINAL_SYSTEM_MESSAGE}, ensure_ascii=False)
-        parts.append(_unescape_value(final_line))
-    # 5. Each history line as JSONL
+        parts.append(final_line)
+    # 5. Each history line as one JSONL record (one escaping layer, json.dumps)
     for h in hist_lines:
-        # An assistant turn that carried tool calls is already rendered.
-        if isinstance(h, str):
-            parts.append(h)
-        elif isinstance(h, dict):
-            parts.append(_unescape_value(json.dumps(h, ensure_ascii=False)))
-        else:
-            parts.append(json.dumps(h, ensure_ascii=False))
+        parts.append(json.dumps(h, ensure_ascii=False))
 
     convo = "\n\n".join(parts)
 
-    return (
-        f"{convo}\n\n"
-        f"<task>\n"
-        f"{SYSTEM_CONTINUE}\n"
-        f"Continue (Or write if you haven't received an answer yet) Assistant's reply, ONLY content\n</task>"
-    ), last_user
+    return convo, last_user
 
 
 # DeepSeek's wire format, as captured from chat.deepseek.com (build 2.5.0):
@@ -3960,6 +3947,11 @@ async def chat_completions(request: Request):
                             fail_reason = delta
                             break
                         if phase == "thinking":
+                            if finish_reason == "tool_calls":
+                                # A call was already delivered, so anything that
+                                # follows is post-call output - interrupt the
+                                # stream right here.
+                                break
                             answer_started = True
                             full_reasoning.append(delta)
                             yield sse(make_chunk(chunk_id, created, req_model, {"reasoning_content": delta}))
@@ -3973,9 +3965,11 @@ async def chat_completions(request: Request):
                             yield sse(make_chunk(chunk_id, created, req_model, {"content": delta}))
                             continue
 
-                        # The buffer hands back ordered events, so text written
-                        # after a tool call is already gone and "stop" only
-                        # arrives when the model really began inventing prose.
+                        # The buffer hands back ordered events: text streams,
+                        # calls stream, and "stop" means the model began
+                        # inventing prose after a delivered call - the whole
+                        # stream ends right there, not just this event batch.
+                        stop_after_calls = False
                         for kind, payload in tool_buf.feed(delta):
                             if kind == "text":
                                 answer_started = True
@@ -4003,7 +3997,13 @@ async def chat_completions(request: Request):
                                     last_sent = time.time()
                                 answer_started = True
                             else:
+                                # ("stop", None): text after a tool call - cut
+                                # the stream immediately; the tail below sends
+                                # the finish chunk and [DONE].
+                                stop_after_calls = True
                                 break
+                        if stop_after_calls:
+                            break
 
                 if fail_reason:
                     if "upstream 413" in fail_reason or "Request Entity Too Large" in fail_reason:
